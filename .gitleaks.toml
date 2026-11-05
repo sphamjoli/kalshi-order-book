@@ -1,0 +1,16 @@
+# Gitleaks configuration for engineering-challenge.
+#
+# Extends the upstream default ruleset. Tests use fixed dummy keys only.
+
+title = "engineering-challenge gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Local build output, never committed but present if this scan ever runs after a build step or on a local dirty working tree — gitleaks dir walks the raw filesystem and does not honor .gitignore"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+]
