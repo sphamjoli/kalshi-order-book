@@ -1,0 +1,32 @@
+# Install once with `make hooks`. Needs lefthook on your PATH.
+pre-commit:
+  parallel: true
+  jobs:
+    - name: rustfmt
+      glob: "*.rs"
+      run: cargo fmt --all --check
+    - name: yaml validation
+      glob: "*.{yml,yaml}"
+      run: ./scripts/checkYaml.sh {staged_files}
+    - name: toml validation
+      glob: "*.toml"
+      run: ./scripts/checkToml.sh {staged_files}
+    - name: shell validation
+      glob: "*.sh"
+      run: ./scripts/checkShell.sh {staged_files}
+    - name: github actions
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: ./scripts/checkActions.sh {staged_files}
+
+commit-msg:
+  jobs:
+    - name: conventional commit message
+      run: ./scripts/checkCommitMsg.sh {1}
+
+pre-push:
+  parallel: true
+  jobs:
+    - name: clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: test
+      run: cargo test
