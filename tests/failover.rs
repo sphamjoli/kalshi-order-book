@@ -1,13 +1,13 @@
 //! Failover between feeds, driven through real collectors.
 
 use engineering_challenge::Side;
-use engineering_challenge::collector::{Collector, CollectorOutput};
+use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::domain::{Level, MarketEvent, Price, Quantity, QuantityDelta};
-use engineering_challenge::failover::Failover;
+use engineering_challenge::failover::{Failover, FeedId};
 use std::time::{Duration, Instant};
 
-const PRIMARY: usize = 0;
-const BACKUP: usize = 1;
+const PRIMARY: FeedId = FeedId(0);
+const BACKUP: FeedId = FeedId(1);
 
 fn collector() -> Collector {
     Collector::new(["M".to_owned()], Duration::from_secs(5))
@@ -17,6 +17,7 @@ fn snapshot_event(quantity: i64) -> MarketEvent {
     MarketEvent::Snapshot {
         symbol: "M".to_owned(),
         exchange_time_ms: 1,
+        exchange_clock: None,
         bids: vec![Level {
             price: Price::try_new(400_000).unwrap(),
             quantity: Quantity::try_new(quantity).unwrap(),
@@ -29,6 +30,7 @@ fn delta_event(time: i64) -> MarketEvent {
     MarketEvent::Delta {
         symbol: "M".to_owned(),
         exchange_time_ms: time,
+        exchange_clock: None,
         side: Side::Buy,
         price: Price::try_new(400_000).unwrap(),
         delta: QuantityDelta::new(1_000_000),
@@ -38,27 +40,30 @@ fn delta_event(time: i64) -> MarketEvent {
 /// Applies `event` and returns what would be recorded.
 fn feed(
     failover: &mut Failover,
-    id: usize,
+    id: FeedId,
     collector: &mut Collector,
     event: MarketEvent,
-) -> Vec<CollectorOutput> {
+) -> Vec<BookRecord> {
     let outputs = collector.handle(event, Instant::now());
     outputs
         .iter()
-        .filter_map(|output| failover.route(id, collector, output))
+        .filter_map(|output| match output {
+            CollectorOutput::Record(record) => failover.route(id, collector, record),
+            CollectorOutput::Resync(_) => None,
+        })
         .collect()
 }
 
-fn released() -> CollectorOutput {
-    CollectorOutput::Released(vec!["M".to_owned()])
+fn released() -> Vec<String> {
+    vec!["M".to_owned()]
 }
 
-fn is_snapshot(records: &[CollectorOutput]) -> bool {
-    matches!(records, [CollectorOutput::Snapshot { .. }])
+fn is_snapshot(records: &[BookRecord]) -> bool {
+    matches!(records, [BookRecord::Snapshot { .. }])
 }
 
-fn is_update(records: &[CollectorOutput]) -> bool {
-    matches!(records, [CollectorOutput::Update { .. }])
+fn is_update(records: &[BookRecord]) -> bool {
+    matches!(records, [BookRecord::Update { .. }])
 }
 
 /// Two live feeds, with the primary owning the market.
@@ -96,10 +101,10 @@ fn only_the_owner_is_recorded() {
 
 #[test]
 fn a_switch_records_a_snapshot_then_deltas() {
-    let (mut failover, primary, mut backup) = running();
-    assert!(failover.route(PRIMARY, &primary, &released()).is_none());
+    let (mut failover, _primary, mut backup) = running();
+    failover.release(PRIMARY, &released());
     let first = feed(&mut failover, BACKUP, &mut backup, delta_event(2));
-    let [CollectorOutput::Snapshot { bids, .. }] = first.as_slice() else {
+    let [BookRecord::Snapshot { bids, .. }] = first.as_slice() else {
         panic!("a switch must start with a snapshot, got {first:?}");
     };
     // The snapshot already holds the delta that triggered the takeover.
@@ -113,27 +118,9 @@ fn a_switch_records_a_snapshot_then_deltas() {
 }
 
 #[test]
-fn a_resync_gives_up_the_market() {
-    let (mut failover, mut primary, mut backup) = running();
-    let lost = feed(
-        &mut failover,
-        PRIMARY,
-        &mut primary,
-        MarketEvent::ContinuityLost,
-    );
-    assert!(lost.is_empty());
-    assert!(is_snapshot(&feed(
-        &mut failover,
-        BACKUP,
-        &mut backup,
-        delta_event(2)
-    )));
-}
-
-#[test]
 fn a_recovered_feed_stays_on_standby() {
     let (mut failover, mut primary, mut backup) = running();
-    failover.route(PRIMARY, &primary, &released());
+    failover.release(PRIMARY, &released());
     feed(&mut failover, BACKUP, &mut backup, delta_event(2));
     assert!(
         feed(
@@ -148,12 +135,185 @@ fn a_recovered_feed_stays_on_standby() {
 
 #[test]
 fn a_standby_loss_leaves_the_owner_in_place() {
-    let (mut failover, mut primary, backup) = running();
-    failover.route(BACKUP, &backup, &released());
+    let (mut failover, mut primary, _backup) = running();
+    failover.release(BACKUP, &released());
     assert!(is_update(&feed(
         &mut failover,
         PRIMARY,
         &mut primary,
         delta_event(2)
     )));
+}
+
+fn clocked_snapshot(clock: u64) -> MarketEvent {
+    MarketEvent::Snapshot {
+        symbol: "M".to_owned(),
+        exchange_time_ms: 1,
+        exchange_clock: Some(clock),
+        bids: vec![],
+        asks: vec![],
+    }
+}
+
+fn clocked_delta(clock: u64) -> MarketEvent {
+    MarketEvent::Delta {
+        symbol: "M".to_owned(),
+        exchange_time_ms: 2,
+        exchange_clock: Some(clock),
+        side: Side::Buy,
+        price: Price::try_new(400_000).unwrap(),
+        delta: QuantityDelta::new(1_000_000),
+    }
+}
+
+/// Two live feeds with clocks, with the primary owning the market.
+fn clocked() -> (Failover, Collector, Collector) {
+    let (mut failover, mut primary, mut backup) = (Failover::default(), collector(), collector());
+    feed(&mut failover, PRIMARY, &mut primary, clocked_snapshot(10));
+    feed(&mut failover, BACKUP, &mut backup, clocked_snapshot(10));
+    (failover, primary, backup)
+}
+
+#[test]
+fn the_first_copy_of_a_change_is_recorded_from_either_feed() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    assert!(is_update(&feed(
+        &mut failover,
+        BACKUP,
+        &mut backup,
+        clocked_delta(11)
+    )));
+    assert!(feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11)).is_empty());
+    assert!(is_update(&feed(
+        &mut failover,
+        PRIMARY,
+        &mut primary,
+        clocked_delta(12)
+    )));
+    assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(12)).is_empty());
+}
+
+#[test]
+fn changes_sharing_a_clock_are_each_recorded_once() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    for _ in 0..2 {
+        assert!(is_update(&feed(
+            &mut failover,
+            PRIMARY,
+            &mut primary,
+            clocked_delta(11)
+        )));
+    }
+    for _ in 0..2 {
+        assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(11)).is_empty());
+    }
+    assert!(is_update(&feed(
+        &mut failover,
+        BACKUP,
+        &mut backup,
+        clocked_delta(12)
+    )));
+}
+
+#[test]
+fn a_stalled_owner_loses_nothing() {
+    let (mut failover, _stalled, mut backup) = clocked();
+    for clock in 11..15 {
+        assert!(is_update(&feed(
+            &mut failover,
+            BACKUP,
+            &mut backup,
+            clocked_delta(clock)
+        )));
+    }
+}
+
+#[test]
+fn a_standby_snapshot_ahead_of_the_record_catches_it_up() {
+    let (mut failover, _primary, mut backup) = clocked();
+    assert!(is_snapshot(&feed(
+        &mut failover,
+        BACKUP,
+        &mut backup,
+        clocked_snapshot(20)
+    )));
+}
+
+#[test]
+fn a_standby_snapshot_level_with_the_record_is_not_repeated() {
+    let (mut failover, primary, backup) = clocked();
+    let record = |collector: &Collector| collector.snapshot("M").unwrap();
+    assert!(
+        failover
+            .route(PRIMARY, &primary, &record(&primary))
+            .is_some()
+    );
+    assert!(failover.route(BACKUP, &backup, &record(&backup)).is_none());
+}
+
+#[test]
+fn a_clock_that_falls_restarts_the_market() {
+    let (mut failover, mut primary, _backup) = clocked();
+    feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11));
+    assert!(is_snapshot(&feed(
+        &mut failover,
+        PRIMARY,
+        &mut primary,
+        clocked_delta(3)
+    )));
+    assert!(is_update(&feed(
+        &mut failover,
+        PRIMARY,
+        &mut primary,
+        clocked_delta(4)
+    )));
+}
+
+#[test]
+fn a_switch_with_clocks_records_a_snapshot_then_deltas() {
+    let (mut failover, _primary, mut backup) = clocked();
+    failover.release(PRIMARY, &released());
+    assert!(is_snapshot(&feed(
+        &mut failover,
+        BACKUP,
+        &mut backup,
+        clocked_delta(11)
+    )));
+    assert!(is_update(&feed(
+        &mut failover,
+        BACKUP,
+        &mut backup,
+        clocked_delta(12)
+    )));
+}
+
+#[test]
+fn a_late_copy_of_a_change_inside_a_snapshot_is_dropped() {
+    let (mut failover, _primary, mut backup) = clocked();
+    assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(10)).is_empty());
+}
+
+#[test]
+fn a_standby_minute_snapshot_after_a_delta_is_not_recorded() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11));
+    feed(&mut failover, BACKUP, &mut backup, clocked_delta(11));
+    let snapshot = backup.snapshot("M").unwrap();
+    assert!(failover.route(BACKUP, &backup, &snapshot).is_none());
+}
+
+#[test]
+fn a_stalled_owner_cannot_cost_a_market_its_minute_snapshot() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    feed(&mut failover, BACKUP, &mut backup, clocked_delta(11));
+    let stale = primary.snapshot("M").unwrap();
+    assert!(failover.route(PRIMARY, &primary, &stale).is_none());
+    let current = backup.snapshot("M").unwrap();
+    assert!(failover.route(BACKUP, &backup, &current).is_some());
+    // The standby now owns the market, so the next minute is its too.
+    assert!(failover.route(BACKUP, &backup, &current).is_some());
+    // The old owner catching up is a standby, so its minute is not repeated.
+    feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11));
+    let caught_up = primary.snapshot("M").unwrap();
+    assert!(failover.route(PRIMARY, &primary, &caught_up).is_none());
 }
