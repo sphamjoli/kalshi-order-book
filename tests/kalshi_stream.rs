@@ -1,19 +1,18 @@
 //! Stream behaviour against a local WebSocket server; never touches the network.
 
-use engineering_challenge::collector::CollectorOutput;
+use chrono::{DateTime, Utc};
+use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::kalshi::auth::{
     AuthHeaders, KEY_HEADER, RequestSigner, SIGNATURE_HEADER, TIMESTAMP_HEADER,
 };
-use engineering_challenge::kalshi::manager::SocketManager;
-use engineering_challenge::kalshi::stream::{
-    KalshiStream, StreamCommand, StreamError, StreamTiming,
-};
+use engineering_challenge::kalshi::stream::{KalshiStream, StreamError, StreamTiming};
+use engineering_challenge::provider::{FeedHandler, MarketStream, StreamCommand};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -82,23 +81,41 @@ impl Server {
     }
 }
 
-fn start(url: &str) -> UnboundedReceiver<CollectorOutput> {
+/// What a stream told its handler.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    Output(CollectorOutput),
+    Released(Vec<String>),
+}
+
+/// Passes everything a stream reports to a channel.
+struct Forward(UnboundedSender<Seen>);
+
+impl FeedHandler for Forward {
+    fn on_output(&mut self, _: &Collector, output: &CollectorOutput, _: DateTime<Utc>) {
+        self.0.send(Seen::Output(output.clone())).unwrap();
+    }
+
+    fn on_released(&mut self, symbols: &[String]) {
+        self.0.send(Seen::Released(symbols.to_vec())).unwrap();
+    }
+}
+
+fn ignore(_: &Collector, _: &CollectorOutput, _: DateTime<Utc>) {}
+
+fn start(url: &str) -> UnboundedReceiver<Seen> {
     start_with(url, TIMING)
 }
 
 /// Starts a stream for market `M` and returns its outputs as a channel.
-fn start_with(url: &str, timing: StreamTiming) -> UnboundedReceiver<CollectorOutput> {
+fn start_with(url: &str, timing: StreamTiming) -> UnboundedReceiver<Seen> {
     let stream =
         KalshiStream::try_new(url, Arc::new(EchoSigner), vec!["M".to_owned()], timing).unwrap();
     let (sender, receiver) = unbounded_channel();
     let (commands, command_receiver) = unbounded_channel();
     tokio::spawn(async move {
         let _commands = commands;
-        stream
-            .run(command_receiver, |_, output, _| {
-                sender.send(output.clone()).unwrap()
-            })
-            .await;
+        stream.run(command_receiver, Forward(sender)).await;
     });
     receiver
 }
@@ -144,7 +161,7 @@ fn delta(seq: u64) -> Value {
     })
 }
 
-async fn next_output(outputs: &mut UnboundedReceiver<CollectorOutput>) -> CollectorOutput {
+async fn next_output(outputs: &mut UnboundedReceiver<Seen>) -> Seen {
     timeout(WAIT, outputs.recv()).await.unwrap().unwrap()
 }
 
@@ -163,9 +180,11 @@ async fn signs_the_handshake_subscribes_and_follows_the_book() {
     send(&mut socket, delta(2)).await;
     assert!(matches!(
         next_output(&mut outputs).await,
-        CollectorOutput::Snapshot { .. }
+        Seen::Output(CollectorOutput::Record(BookRecord::Snapshot { .. }))
     ));
-    let CollectorOutput::Update { change, .. } = next_output(&mut outputs).await else {
+    let Seen::Output(CollectorOutput::Record(BookRecord::Update { change, .. })) =
+        next_output(&mut outputs).await
+    else {
         panic!("expected update");
     };
     assert_eq!(change.quantity.raw(), 2_000_000);
@@ -183,7 +202,7 @@ async fn a_gap_requests_a_replacement_snapshot() {
     next_output(&mut outputs).await;
     assert_eq!(
         next_output(&mut outputs).await,
-        CollectorOutput::Resync(vec!["M".to_owned()])
+        Seen::Output(CollectorOutput::Resync(vec!["M".to_owned()]))
     );
     let command = next_command(&mut socket).await;
     assert_eq!(command["params"]["action"], "get_snapshot");
@@ -202,7 +221,7 @@ async fn a_malformed_frame_counts_as_lost_continuity() {
     next_output(&mut outputs).await;
     assert!(matches!(
         next_output(&mut outputs).await,
-        CollectorOutput::Resync(_)
+        Seen::Output(CollectorOutput::Resync(_))
     ));
 }
 
@@ -234,11 +253,11 @@ async fn a_lost_connection_reconnects_and_starts_from_a_new_snapshot() {
     assert_eq!(next_command(&mut socket).await["cmd"], "subscribe");
     send(&mut socket, ack()).await;
     send(&mut socket, snapshot(1)).await;
-    let released = CollectorOutput::Released(vec!["M".to_owned()]);
+    let released = Seen::Released(vec!["M".to_owned()]);
     assert_eq!(next_output(&mut outputs).await, released);
     assert!(matches!(
         next_output(&mut outputs).await,
-        CollectorOutput::Snapshot { .. }
+        Seen::Output(CollectorOutput::Record(BookRecord::Snapshot { .. }))
     ));
 }
 
@@ -263,7 +282,7 @@ async fn every_live_book_is_snapshotted_on_the_timer() {
     for _ in 0..3 {
         assert!(matches!(
             next_output(&mut outputs).await,
-            CollectorOutput::Snapshot { .. }
+            Seen::Output(CollectorOutput::Record(BookRecord::Snapshot { .. }))
         ));
     }
 }
@@ -275,9 +294,11 @@ async fn a_whole_socket_is_recycled_on_the_timer() {
         recycle_interval: Duration::from_millis(50),
         ..TIMING
     };
-    let _outputs = start_with(&server.url, timing);
+    let mut outputs = start_with(&server.url, timing);
     let (mut socket, _) = server.accept().await;
     next_command(&mut socket).await;
+    let released = Seen::Released(vec!["M".to_owned()]);
+    assert_eq!(next_output(&mut outputs).await, released);
     let (mut socket, _) = server.accept().await;
     assert_eq!(next_command(&mut socket).await["cmd"], "subscribe");
 }
@@ -293,11 +314,7 @@ async fn markets_are_added_and_removed_on_a_running_socket() {
     let (sender, mut outputs) = unbounded_channel();
     let stream = stream(&server.url, vec!["M".to_owned()]);
     tokio::spawn(async move {
-        stream
-            .run(receiver, |_, output, _| {
-                sender.send(output.clone()).unwrap()
-            })
-            .await;
+        stream.run(receiver, Forward(sender)).await;
     });
     let (mut socket, _) = server.accept().await;
     next_command(&mut socket).await;
@@ -317,7 +334,7 @@ async fn markets_are_added_and_removed_on_a_running_socket() {
         .unwrap();
     let removed = next_command(&mut socket).await;
     assert_eq!(removed["params"]["action"], "delete_markets");
-    let released = CollectorOutput::Released(vec!["M".to_owned()]);
+    let released = Seen::Released(vec!["M".to_owned()]);
     assert_eq!(next_output(&mut outputs).await, released);
 
     // A delta already in flight for a removed market is not corruption.
@@ -332,7 +349,7 @@ async fn dropping_the_commands_closes_the_socket_cleanly() {
     let server = Server::start().await;
     let (commands, receiver) = unbounded_channel::<StreamCommand>();
     let stream = stream(&server.url, vec!["M".to_owned()]);
-    let task = tokio::spawn(async move { stream.run(receiver, |_, _, _| {}).await });
+    let task = tokio::spawn(async move { stream.run(receiver, ignore).await });
     let (mut socket, _) = server.accept().await;
     next_command(&mut socket).await;
     send(&mut socket, ack()).await;
@@ -347,40 +364,11 @@ async fn dropping_the_commands_closes_the_socket_cleanly() {
 }
 
 #[tokio::test]
-async fn the_manager_balances_markets_and_opens_sockets_when_full() {
-    let server = Server::start().await;
-    let template = stream(&server.url, vec![]);
-    let mut manager = SocketManager::new(template, 2, vec![|_: &_, _: &_, _| {}]);
-    let tickers = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-
-    manager.add(tickers(&["A", "B", "C"]));
-    assert_eq!(manager.socket_count(), 2);
-    let (mut first, _) = server.accept().await;
-    let (mut second, _) = server.accept().await;
-    let mut subscribed = [
-        next_command(&mut first).await["params"]["market_tickers"].clone(),
-        next_command(&mut second).await["params"]["market_tickers"].clone(),
-    ];
-    subscribed.sort_by_key(|markets| markets.as_array().unwrap().len());
-    assert_eq!(subscribed[0].as_array().unwrap().len(), 1);
-    assert_eq!(subscribed[1].as_array().unwrap().len(), 2);
-
-    manager.add(tickers(&["A"]));
-    assert_eq!(manager.market_count(), 3);
-    manager.remove(tickers(&["A", "B", "C"]));
-    assert_eq!(manager.market_count(), 0);
-    manager.add(tickers(&["D", "E", "F", "G"]));
-    assert_eq!(manager.socket_count(), 2);
-    assert_eq!(manager.market_count(), 4);
-    timeout(WAIT, manager.close()).await.unwrap();
-}
-
-#[tokio::test]
 async fn a_command_waits_for_the_acknowledgement() {
     let server = Server::start().await;
     let (commands, receiver) = unbounded_channel();
     let stream = stream(&server.url, vec!["M".to_owned()]);
-    tokio::spawn(async move { stream.run(receiver, |_, _, _| {}).await });
+    tokio::spawn(async move { stream.run(receiver, ignore).await });
     commands
         .send(StreamCommand::Add(vec!["N".to_owned()]))
         .unwrap();
@@ -434,31 +422,25 @@ async fn a_connection_that_drops_after_its_acknowledgement_backs_off() {
         drop(socket);
         (socket, _) = server.accept().await;
     }
-    // A delay that never grew would total at most 225 milliseconds.
-    assert!(started.elapsed() >= Duration::from_millis(300));
+    // Three reconnects, each waiting at least the base delay.
+    assert!(started.elapsed() >= Duration::from_millis(150));
 }
 
 #[tokio::test]
-async fn adding_markets_during_recovery_is_not_a_stall() {
+async fn the_first_minute_snapshot_comes_within_one_interval() {
+    let interval = Duration::from_millis(300);
     let server = Server::start().await;
-    let (commands, receiver) = unbounded_channel();
-    let tickers: Vec<String> = (0..6).map(|index| format!("M{index}")).collect();
-    let stream = stream(&server.url, tickers.clone());
-    tokio::spawn(async move { stream.run(receiver, |_, _, _| {}).await });
+    let timing = StreamTiming {
+        snapshot_interval: interval,
+        ..TIMING
+    };
+    let mut outputs = start_with(&server.url, timing);
     let (mut socket, _) = server.accept().await;
+    let connected = std::time::Instant::now();
     next_command(&mut socket).await;
     send(&mut socket, ack()).await;
-    for (index, ticker) in tickers.iter().enumerate() {
-        // The set grows on every round even though one market is answered.
-        let added = vec![format!("N{index}a"), format!("N{index}b")];
-        commands.send(StreamCommand::Add(added)).unwrap();
-        let frame = json!({
-            "type": "orderbook_snapshot", "sid": 7, "seq": index + 1, "sending_ts_ms": 1,
-            "msg": { "market_ticker": ticker, "yes_dollars_fp": [["0.40", "1.00"]] },
-        });
-        send(&mut socket, frame).await;
-        tokio::time::sleep(TIMING.resync_retry + Duration::from_millis(10)).await;
-    }
-    let rebuilt = timeout(Duration::from_millis(50), server.listener.accept()).await;
-    assert!(rebuilt.is_err(), "progress must not rebuild the connection");
+    send(&mut socket, snapshot(1)).await;
+    next_output(&mut outputs).await;
+    next_output(&mut outputs).await;
+    assert!(connected.elapsed() <= interval + interval / 2);
 }

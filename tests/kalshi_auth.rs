@@ -56,14 +56,11 @@ fn invalid_pem_is_rejected() {
 }
 
 #[test]
-fn debug_output_redacts_the_key() {
+fn debug_output_redacts_secrets() {
     let output = format!("{:?}", signer());
     assert!(output.contains("<redacted>"));
     assert!(!output.contains("SigningKey"));
-}
 
-#[test]
-fn debug_output_redacts_the_headers() {
     let headers = signer().sign(1, "GET", "/a");
     let output = format!("{headers:?}");
     assert!(!output.contains(&headers.signature));
