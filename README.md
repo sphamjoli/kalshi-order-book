@@ -4,9 +4,9 @@ This repository contains a Rust service that records the order books of live, no
 
 ## Data path
 
-![Data flow from Kalshi through discovery, sockets, normaliser, collector and queue to the SBE writer](docs/diagrams/architecture.svg)
+![Data flow from a market provider through the provider contracts, tracker, socket manager, collectors, failover and queue to the SBE writer](docs/diagrams/architecture.svg)
 
-`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes many minutes. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full.
+`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes many minutes. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. It also tracks listed markets that have not opened, and follows each at its opening time. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full. A feed never opens more than its share of the provider's connection limit. Past that point sockets go over their target size, because coverage matters more than an even spread. A socket task that panics is restarted with its markets at the next poll.
 
 Each `KalshiStream` owns one signed WebSocket connection. It reconnects after a failure, with a delay that grows while connections keep failing, and replaces a healthy connection every six hours. Incoming frames pass to `Normaliser`, which checks sequence numbers and converts Kalshi's format into exchange-neutral events. Kalshi quotes YES and NO bids, so a NO bid at price *p* is recorded as a sell at 1 − *p*.
 
@@ -14,13 +14,17 @@ Each `KalshiStream` owns one signed WebSocket connection. It reconnects after a 
 
 ## Redundancy
 
-Every market runs on two independent feeds by default, each with its own sockets and its own book, so a lost socket does not leave a market without a live copy. `Failover` sits between the feeds and the output queue and records one owner per market. Output from the owner is recorded and output from the other feed is discarded. When a connection ends or a book loses continuity, the feed gives up ownership of the affected markets, and the next feed to produce an event for such a market takes over. The takeover records a full snapshot of that feed's book, and its deltas follow, so a consumer never receives deltas against a book it has not seen. `--feeds` sets the number of copies, and each copy adds its own sockets and traffic.
+Every market runs on two independent feeds by default, each with its own sockets and its own book, so a lost socket does not leave a market without a live copy. `Failover` sits between the feeds and the output queue and merges them. Kalshi's exchange clock is the same on every connection, so it identifies each change. The first feed to deliver a change is recorded, later copies are discarded, and a stalled connection therefore costs nothing while another feed keeps up. Receipt times are also the earliest seen. One feed owns each market and supplies its minute snapshots. When an owner's connection ends or its book loses continuity, it gives up the market, and the next feed to produce an event takes over by recording a full snapshot of its book, with its deltas following, so a consumer never receives deltas against a book it has not seen. A standby's snapshot is recorded only when it is ahead of the record. A clock that falls, which happens only during exchange maintenance, starts the market again from a snapshot. `--feeds` sets the number of copies, and each copy adds its own sockets and traffic.
+
+## Adding a provider
+
+`src/provider.rs` holds the contracts that separate the core from any exchange. `MarketDirectory` lists markets and what changed, `MarketStream` runs one connection that feeds books, and `FeedHandler` receives what a stream produces. `SocketManager`, `MarketTracker`, `Collector`, `Failover`, `FeedRouter` and the output depend only on these and on exchange-neutral domain types. A new provider implements the two traits in its own module and is chosen in `app.rs`. `tests/provider.rs` runs a fake provider through the real tracker and manager to hold that boundary in place.
 
 ## When a book is trusted
 
 A market starts in the awaiting-snapshot state, in which nothing is published. The first snapshot makes its book live, and only a live book produces deltas and minute snapshots. Removing a market retires it, so that frames already in flight are not mistaken for corruption.
 
-A live book returns to awaiting a snapshot if a sequence gap appears, a frame cannot be read, a delta contradicts the book, or the book stays crossed for more than five seconds. The collector then requests a replacement. Should replacements stop arriving for every market on a socket, the connection is rebuilt, since sequence numbers carry meaning only within one connection. A single overdue market is retried without disturbing its neighbours. The output format has no gap record, so a consumer sees a pause for that market followed by a fresh snapshot.
+A live book returns to awaiting a snapshot if a sequence gap appears, a frame cannot be read, a delta contradicts the book, or the book stays crossed for more than five seconds. The collector then requests a replacement. Should replacements stop arriving for every market on a socket, a decision `ResyncWatch` makes, the connection is rebuilt, since sequence numbers carry meaning only within one connection. A single overdue market is retried without disturbing its neighbours. The output format has no gap record, so a consumer sees a pause for that market followed by a fresh snapshot.
 
 ## Design decisions
 
@@ -30,7 +34,9 @@ Publishing stops as soon as continuity is uncertain. This accepts a pause in the
 
 Markets are removed when Kalshi lists them as closed or settled. An hourly full scan catches anything the polls missed. Only a complete scan of plausible size may remove a market, and only one placed before that scan began, so neither a failed scan nor an exchange fault can look like markets disappearing.
 
-The output queue blocks when full, so records are never discarded silently. The cost is that a stalled writer delays socket reads and therefore receipt times. Receipt time is taken once per frame before parsing, and each record carries both that time and the exchange time. Order is guaranteed within a market and is not promised across markets.
+The output queue blocks when full, so records are never discarded silently. The cost is that a stalled writer delays socket reads and therefore receipt times. Receipt time is taken once per frame before parsing, and each record carries both that time and the exchange time. Kalshi documents its timestamps as optional, so a delta without one uses the message's sending time, and the local time if that is missing too. Each socket starts its minute snapshots at a random offset, so that sockets do not all pause reading together. Order is guaranteed within a market and is not promised across markets.
+
+The supplied reader accepts only 64 MiB chunks, so the writer emits whole chunks. A consumer of stdout therefore receives records a chunk at a time, not as each change happens, and the final partial chunk arrives at shutdown. Receipt times are taken before this buffering, so the delay does not affect what is recorded.
 
 The REST client refuses redirects and insecure URLs, because a redirect would carry signed headers to another host.
 
@@ -156,10 +162,13 @@ The collector is a long-running process whose product is a recording. The challe
 
 | Module | Responsibility |
 |---|---|
-| `kalshi/rest.rs`, `kalshi/auth.rs` | HTTP, retries and Ed25519 signing |
-| `kalshi/discovery.rs` | Which markets to follow |
-| `kalshi/manager.rs` | Which socket holds each market |
-| `kalshi/stream.rs` | The life and timers of one connection |
+| `provider.rs` | The contracts every provider implements |
+| `discovery.rs` | Which markets to follow |
+| `manager.rs` | Which socket holds each market |
+| `resync.rs` | What to do about unanswered snapshot requests |
+| `router.rs` | One feed's route to the writer |
+| `kalshi/rest.rs`, `kalshi/auth.rs`, `kalshi/directory.rs` | HTTP, retries, Ed25519 signing and the market list |
+| `kalshi/stream.rs`, `kalshi/session.rs` | The life and timers of a connection, and its state |
 | `kalshi/wire.rs`, `kalshi/normalise.rs` | Kalshi's message format |
 | `domain.rs`, `collector.rs` | Exchange-neutral book rules |
 | `failover.rs` | Which feed is recorded for each market |
@@ -220,6 +229,6 @@ The long run recorded 960 MiB, including 1,593,029 snapshots, all decoded by the
 
 The service recorded and decoded data correctly at tens of thousands of markets, but no run with sockets open completed a scan of the roughly 180,000 markets, so full coverage remains undemonstrated. Page times rose as runs progressed, while socket size had no visible effect on page time or total losses. The near-zero backlog suggests the reader keeps up. Peak traffic close to the measured download figure is consistent with link congestion, which is the leading explanation but was not isolated.
 
-These results come from a single machine, network and day, and most configurations ran once. The two runs at 2,000 markets per socket differed by about six times in scan speed, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. The runs also predate redundancy and later fixes to reconnect backoff and stall detection. A repeat from a well-connected machine is the next step.
+These results come from a single machine, network and day, and most configurations ran once. The two runs at 2,000 markets per socket differed by about six times in scan speed, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. The figures are from an earlier run and will be re-run, and a repeat from a well-connected machine is the next step.
 
-The automated tests in `tests/` cover book rules, recovery, failover, normalising, discovery and output.
+The automated tests in `tests/` cover book rules, recovery, failover, routing, the provider contracts, normalising, discovery and output.
