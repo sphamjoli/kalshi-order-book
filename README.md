@@ -6,7 +6,7 @@ This repository contains a Rust service that records the order books of live, no
 
 ![Data flow from a market provider through the provider contracts, tracker, socket manager, collectors, failover and queue to the SBE writer](docs/diagrams/architecture.svg)
 
-`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes many minutes. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. It also tracks listed markets that have not opened, and follows each at its opening time. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full. A feed never opens more than its share of the provider's connection limit. Beyond that limit, sockets exceed their target size, because coverage takes priority over an even spread. A socket task that panics is restarted with its markets by the polling loop.
+`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes many minutes. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. It also tracks listed markets that have not opened, and follows each at its opening time. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full. A feed never opens more than its share of the provider's connection limit. Beyond that limit, sockets exceed their target size, because coverage takes priority over an even spread. The polling loop restarts a socket task that panics, together with its markets.
 
 Each `KalshiStream` owns one signed WebSocket connection. It reconnects after a failure, with a delay that grows while connections keep failing, and replaces a healthy connection every six hours. Incoming frames pass to `Normaliser`, which checks sequence numbers and converts Kalshi's format into exchange-neutral events. Kalshi quotes YES and NO bids, so a NO bid at price *p* is recorded as a sell at 1 − *p*.
 
@@ -14,17 +14,19 @@ Each `KalshiStream` owns one signed WebSocket connection. It reconnects after a 
 
 ## Redundancy
 
-Every market runs on two independent feeds by default, each with its own sockets and its own book, so a lost socket does not leave a market without a live copy. `Failover` sits between the feeds and the output queue and merges them. Kalshi's exchange clock is the same on every connection, so it identifies each change. The copy delivered first is recorded and later copies are discarded, so a stalled connection loses no change while another feed keeps up. One feed owns each market and supplies its minute snapshots. When an owner's connection ends or its book loses continuity, it gives up the market. The next feed to produce an event takes over by recording a full snapshot of its book, followed by its deltas, so a consumer never receives deltas against a book it has not seen. A standby's snapshot is recorded only when it is ahead of the record, or level with it while the owner is behind, in which case the standby becomes the owner. A clock that moves backwards, which happens only during exchange maintenance, restarts the market from a snapshot. `--feeds` sets the number of copies, and each copy adds its own sockets and traffic.
+Every market runs on two independent feeds by default, each with its own sockets and its own book, so a lost socket does not leave a market without a live copy. `Failover` sits between the feeds and the output queue and merges them. Kalshi's exchange clock is the same on every connection, so it identifies each change. The copy delivered first is recorded and later copies are discarded, so a stalled connection loses no change while another feed keeps up.
+
+One feed owns each market and supplies its minute snapshots. When an owner's connection ends or its book loses continuity, it gives up the market. The next feed to produce an event takes over by recording a full snapshot of its book, followed by its deltas, so a consumer never receives deltas against a book it has not seen. A standby's snapshot is recorded only when it is ahead of the record, or level with it while the owner is behind. In either case, the standby becomes the owner. A clock that moves backwards, which happens only during exchange maintenance, restarts the market from a snapshot. `--feeds` sets the number of copies, and each copy adds its own sockets and traffic.
 
 ## Adding a provider
 
-`src/provider.rs` holds the contracts that separate the core from any exchange. `MarketDirectory` lists markets and what changed, `MarketStream` runs one connection that feeds books, and `FeedHandler` receives what a stream produces. `SocketManager`, `MarketTracker`, `Collector`, `Failover`, `FeedRouter` and the output depend only on these and on exchange-neutral domain types. A new provider implements the two traits in its own module and is chosen in `app.rs`. `tests/provider.rs` runs a fake provider through the real tracker and manager to test that boundary.
+`src/provider.rs` holds the contracts that separate the core from any exchange. `MarketDirectory` lists markets and what changed, `MarketStream` runs one connection that feeds books, and `FeedHandler` receives what a stream produces. `SocketManager`, `MarketTracker`, `Collector`, `Failover`, `FeedRouter` and the output depend only on these and on exchange-neutral domain types. A new provider implements `MarketDirectory` and `MarketStream` in its own module and is chosen in `app.rs`. `tests/provider.rs` runs a fake provider through the real tracker and manager to test that boundary.
 
 ## When a book is trusted
 
 A market starts in the awaiting-snapshot state, in which nothing is published. The first snapshot makes its book live, and only a live book produces deltas and minute snapshots. Removing a market retires it, so that frames already in flight are not mistaken for corruption.
 
-A live book returns to awaiting a snapshot if a sequence gap appears, a frame cannot be read, a delta contradicts the book, or the book stays crossed for more than five seconds. The collector then requests a replacement. `ResyncWatch` decides when replacements have stopped arriving for every market on a socket. The connection is then rebuilt, since sequence numbers carry meaning only within one connection. A single overdue market is retried without affecting the other markets on its socket. The output format has no gap record, so a consumer sees a pause for that market followed by a fresh snapshot.
+A live book returns to awaiting a snapshot if a sequence gap appears, a frame cannot be read, a delta contradicts the book, or the book stays crossed for more than five seconds. The collector then requests a replacement snapshot. `ResyncWatch` decides when replacements have stopped arriving for every market on a socket. The connection is then rebuilt, since sequence numbers carry meaning only within one connection. A single overdue market is retried without affecting the other markets on its socket. The output format has no gap record, so a consumer sees a pause for that market followed by a fresh snapshot.
 
 ## Design decisions
 
@@ -32,7 +34,7 @@ The collector for each socket owns that socket's books. A lost message can only 
 
 Publishing stops as soon as continuity is uncertain. This accepts a pause in the record to avoid recording a book that may be wrong. The choice follows from the purpose of the data, which is later analysis of what the market showed.
 
-Markets are removed when Kalshi lists them as closed or settled. An hourly full scan catches anything the polls missed. A scan may remove a market only if the scan is complete and of plausible size and the market was placed before the scan began, so neither a failed scan nor an exchange fault can be mistaken for markets disappearing.
+Markets are removed when Kalshi lists them as closed or settled. An hourly full scan catches anything the polls missed. A scan may remove a market only if the scan is complete and of plausible size and the market was placed before the scan began. Neither a failed scan nor an exchange fault can therefore be mistaken for markets disappearing.
 
 The output queue blocks when full, so records are never discarded silently. The cost is that a stalled writer delays socket reads and therefore receipt times. Receipt time is taken once per frame before parsing, and each record carries both that time and the exchange time. Kalshi documents its timestamps as optional, so a delta without one uses the message's sending time, and the local time if that is missing too. Each socket starts its minute snapshots at a random offset, so that sockets do not all pause reading together. Order is guaranteed within a market and is not guaranteed across markets.
 
@@ -178,11 +180,11 @@ The collector is a long-running process whose product is a recording. The challe
 
 ## Evaluation
 
-The evaluation asks whether the service records Kalshi books correctly at scale, and what limits how many markets it can follow.
+The evaluation asks whether the service records Kalshi books in a decodable form at scale, and what limits how many markets it can follow.
 
 ### Method
 
-All runs used one Mac on a home connection against production Kalshi on 5 November 2026. Each run started with no state and stopped on SIGINT. A baseline run scanned markets with no sockets open. Size runs varied markets per socket. A backlog run sampled throughput, unread socket bytes and CPU every 10 to 15 seconds. A link run measured the connection with `networkQuality` while idle and again during collection. A connection loss is any connection that ended and was replaced. A market is placed once it is handed to a socket. All runs used a single feed. Every experiment except the long run can be repeated with `make experiments`, and `make summary` prints these tables from the logs. [CONTRIBUTIONS.md](CONTRIBUTIONS.md) describes the targets.
+All runs used one Mac on a home connection against production Kalshi on 5 November 2026. Each run started with no state and stopped on SIGINT. A baseline run scanned markets with no sockets open. Size runs varied markets per socket. A backlog run sampled throughput, unread socket bytes and CPU every 10 to 15 seconds. A link run measured the connection with `networkQuality` while idle and again during collection. A connection loss is any connection that ended and was replaced. A market is placed once it is handed to a socket. All runs with sockets open used a single feed. Every experiment except the long run can be repeated with `make experiments`, and `make summary` prints these tables from the logs. [CONTRIBUTIONS.md](CONTRIBUTIONS.md) describes the targets.
 
 ### Results
 
@@ -223,12 +225,12 @@ All runs used one Mac on a home connection against production Kalshi on 5 Novemb
 | Upload responsiveness (ms) | 724 | 1,276 |
 | Idle latency (ms) | 17 | 40 |
 
-The long run recorded 960 MiB, including 1,593,029 snapshots, all decoded by the supplied reader, with memory at or below 140 MB. In the backlog run, CPU averaged 10.5% of one core and peaked at 27.5%, traffic reached at least 25 Mbit/s, and unread socket bytes were zero in 88 of 90 samples. No REST request was retried in any timed run. Every lost connection was replaced, and every run exited cleanly.
+The long run recorded 960 MiB, including 1,593,029 snapshots, all decoded by the supplied reader, with memory at or below 140 MB. In the backlog run, CPU averaged 10.5% of one core and peaked at 27.5%, traffic reached at least 25 Mbit/s, and unread socket bytes were zero in 88 of 90 samples. No REST request was retried in any timed run. Every run exited cleanly.
 
 ### Discussion
 
-The service recorded data that the supplied reader decoded at tens of thousands of markets, but no run with sockets open completed a scan of the roughly 180,000 markets, so full coverage remains undemonstrated. Page times rose as runs progressed, while socket size had no visible effect on page time or total losses. The near-zero backlog suggests that socket reads keep up. Peak traffic close to the measured download figure is consistent with link congestion, which is the leading explanation but was not isolated.
+The service recorded data that the supplied reader decoded at tens of thousands of markets. However, no run with sockets open completed a scan of the roughly 180,000 markets, so full coverage remains undemonstrated. Page times rose as runs with sockets open progressed, while socket size had no visible effect on page time or total losses. The near-zero backlog suggests that socket reads keep up. Peak traffic close to the measured download figure is consistent with link congestion, which is the leading explanation but was not isolated.
 
-These results come from a single machine, network and day, and most configurations ran once. The two runs at 2,000 markets per socket differed in scan speed more than four times, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. The figures are from an earlier run and will be re-run, and a repeat from a well-connected machine is the next step.
+These results come from a single machine, network and day, and most configurations ran once. The two runs at 2,000 markets per socket differed in scan speed by a factor of more than four, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. The figures are from an earlier run and will be re-run, and a repeat from a well-connected machine is the next step.
 
 The automated tests in `tests/` cover book rules, recovery, failover, routing, the provider contracts, normalising, discovery and output.
