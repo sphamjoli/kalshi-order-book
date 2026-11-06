@@ -1,13 +1,13 @@
 //! Domain units and order books: exact fixed-point values and deterministic
-//! book transitions. Owns no I/O. Owns the validated representation of price
-//! and quantity once data has crossed the wire boundary.
+//! book transitions. Performs no I/O. Owns the validated representation of
+//! price and quantity once data has crossed the wire boundary.
 //!
 //! Invariants:
 //!
 //! - A book is built whole from one snapshot; replacing it replaces the value.
 //! - Each transition is atomic: a rejected input changes nothing.
-//! - Output uses absolute quantities; zero deletes a level; stored
-//!   quantities stay positive.
+//! - Output uses absolute quantities, and zero deletes a level.
+//! - Stored quantities stay positive.
 
 use crate::Side;
 use std::collections::BTreeMap;
@@ -213,9 +213,8 @@ impl Book {
         self.bids.len().max(self.asks.len())
     }
 
-    /// Returns whether the best bid is at or above the best ask. Crossing is
-    /// not assumed impossible, so this is a fact for the caller to judge, not
-    /// an error. O(log L) for L levels.
+    /// Returns whether the best bid is at or above the best ask. The caller
+    /// decides how to treat a crossed book. O(log L) for L levels.
     pub fn is_crossed(&self) -> bool {
         match (self.bids.last_key_value(), self.asks.first_key_value()) {
             (Some((bid, _)), Some((ask, _))) => bid >= ask,

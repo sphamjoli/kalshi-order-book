@@ -1,7 +1,7 @@
 //! Output: maps collector results to SBE records and is the single ordered
 //! writer, using the supplied aligned helpers so the supplied reader can open
 //! the result. Records reach the path a chunk at a time. Diagnostics go to
-//! stderr. Per-market order is guaranteed; global time order across markets is
+//! stderr. Records are written in queue order, so time order across markets is
 //! not promised.
 
 use crate::collector::BookRecord;
@@ -21,8 +21,8 @@ use tokio::sync::mpsc::Receiver;
 /// The chunk size the supplied reader expects.
 const CHUNK_SIZE: usize = 64 << 20;
 
-/// Reasons output cannot be written or read. A broken pipe is one of them:
-/// a reader that left means the run did not record what it claims.
+/// Reasons output cannot be written or read. A broken pipe counts as a failure,
+/// because records written after the reader left are lost.
 #[derive(Debug, Error)]
 pub enum OutputError {
     /// The supplied SBE helpers report `anyhow::Error`, including for I/O.
@@ -48,7 +48,7 @@ pub struct OutputRecord {
 pub struct Summary {
     pub snapshots: u64,
     pub updates: u64,
-    /// Distinct markets with at least one record, which is what coverage is.
+    /// Distinct markets with at least one record.
     pub symbols: usize,
 }
 

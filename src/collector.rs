@@ -1,13 +1,14 @@
 //! Collector: the book lifecycle of the markets on one stream. Owns all
-//! mutable book state and decides when a book can no longer be believed. Knows
-//! nothing of sockets or wire formats, and takes the time as a value, so every
-//! transition is deterministic.
+//! mutable book state and decides when a book can no longer be trusted. Has no
+//! dependency on sockets or wire formats and takes the time as a value, so
+//! every transition is deterministic.
 //!
 //! Invariants:
 //!
 //! - No delta is applied to a book that is not live.
-//! - For each market, output starts with a snapshot.
-//! - A book with uncertain continuity is never published.
+//! - For each market, the first record is a snapshot.
+//! - A book whose continuity is known to be lost is not published until a
+//!   snapshot replaces it.
 
 use crate::Side;
 use crate::domain::{Book, Level, LevelChange, MarketEvent, Price, QuantityDelta};
@@ -15,8 +16,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// The most levels a side may hold, because the output format counts them in
-/// 16 bits and a record it cannot encode would stop the whole run.
+/// The most levels a delta may leave on a side, because the output format
+/// counts them in 16 bits and a record it cannot encode would stop the run.
 const MAX_BOOK_DEPTH: usize = 65_535;
 
 /// Holds the markets of one stream, because a lost message on a stream
@@ -30,7 +31,7 @@ pub struct Collector {
 /// Where one market is in its lifecycle.
 #[derive(Debug)]
 enum MarketState {
-    /// Subscribed, or awaiting a replacement: no book can be trusted.
+    /// Subscribed or awaiting a replacement snapshot. No book is held.
     AwaitingSnapshot,
     Live {
         book: Book,
@@ -44,14 +45,14 @@ enum MarketState {
     Retired,
 }
 
-/// Where a change sits on the exchange.
+/// The exchange time and clock of a change.
 #[derive(Debug, Clone, Copy)]
 struct Stamp {
     time_ms: i64,
     clock: Option<u64>,
 }
 
-/// One thing to record.
+/// A book state or change to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookRecord {
     /// The whole book of a market.
@@ -174,8 +175,8 @@ impl Collector {
         }
     }
 
-    /// Resyncs books that have stayed crossed past the grace period. Runs on a
-    /// timer, because a drifted market may never send another delta.
+    /// Resyncs books that have stayed crossed for at least the grace period.
+    /// Runs on a timer, because a drifted market may never send another delta.
     #[must_use = "a dropped resync leaves markets unpublished"]
     pub fn tick(&mut self, now: Instant) -> Vec<CollectorOutput> {
         let drifted: Vec<String> = self
@@ -198,7 +199,7 @@ impl Collector {
     }
 
     /// Returns a snapshot of every live book, so a quiet market is still
-    /// recorded. A book that cannot be trusted is left out.
+    /// recorded.
     pub fn snapshots(&self) -> Vec<CollectorOutput> {
         self.markets
             .keys()

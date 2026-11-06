@@ -1,8 +1,8 @@
-//! Failover: merges the feeds of each market into one record. Every market
-//! runs on several independent feeds, each with its own book, and the exchange
-//! clock says which changes are the same. The first feed to deliver a change
-//! is recorded and later copies are discarded, so a slow or stalled feed costs
-//! nothing while another keeps up. One feed owns each market and supplies its
+//! Failover: merges the feeds of each market into one record. A market can run
+//! on several independent feeds, each with its own book, and the exchange clock
+//! identifies matching changes. The first feed to deliver a change is recorded
+//! and later copies are discarded, so a slow or stalled feed does not delay the
+//! record while another keeps up. One feed owns each market and supplies its
 //! minute snapshots. An owner that loses the market gives it up, and the next
 //! feed with a live book takes over with a full snapshot, so deltas never
 //! continue from a book the record has not seen.
@@ -76,7 +76,7 @@ impl Failover {
         wanted.then(|| record.clone())
     }
 
-    /// Stops counting on `feed` for `symbols`. An owner gives up the market,
+    /// Removes `feed` from `symbols`. An owner gives up the market,
     /// and a market with no feed left is forgotten, so closed markets do not
     /// build up.
     pub fn release(&mut self, feed: FeedId, symbols: &[String]) {
@@ -103,9 +103,9 @@ impl MarketMerge {
         }
     }
 
-    /// The owner supplies the minute snapshots. If it has fallen behind the
-    /// record, a standby that is level or ahead replaces it, so a stalled owner
-    /// cannot cost a market its snapshot.
+    /// The owner supplies the minute snapshots. A standby replaces it when the
+    /// standby is ahead of the record, or level with the record while the owner
+    /// is behind, so a stalled owner does not stop a market's snapshots.
     fn wants_snapshot(&mut self, feed: FeedId, position: Option<Position>) -> bool {
         let is_owner = self.owner == Some(feed);
         let (Some(position), Some(recorded)) = (position, self.recorded) else {
@@ -129,8 +129,8 @@ impl MarketMerge {
     }
 
     /// Moves `feed` to `clock`, and returns its new position and whether its
-    /// own clock went backwards, which only an exchange maintenance does. A
-    /// snapshot covers every change at its clock, so it sits after all of them.
+    /// own clock went backwards, as exchange maintenance can cause. A snapshot
+    /// covers every change at its clock, so it sits after all of them.
     fn advance(
         &mut self,
         feed: FeedId,

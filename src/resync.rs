@@ -1,5 +1,5 @@
 //! Decides what to do about markets still waiting for replacement snapshots.
-//! Pure, so every path can be tested without a socket.
+//! Performs no I/O, so every path can be tested without a socket.
 
 use std::collections::HashSet;
 
@@ -31,7 +31,7 @@ impl ResyncWatch {
     /// Reviews the markets in `awaiting`. Progress is a market leaving the
     /// set, because its size also changes when markets are added. A stall
     /// rebuilds the connection only when `has_live_books` is false, so one
-    /// stuck market does not cost its healthy neighbours.
+    /// stuck market does not interrupt markets with live books.
     pub fn review(&mut self, awaiting: &[String], has_live_books: bool) -> ResyncDecision {
         let current: HashSet<String> = awaiting.iter().cloned().collect();
         let progressed = self

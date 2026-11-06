@@ -11,8 +11,8 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 /// Settings read from the environment. Holds the key path, not key material.
-/// The URLs have no default, so one environment cannot silently stand in for
-/// another.
+/// The URLs have no default, so an unset URL fails instead of selecting another
+/// environment.
 #[derive(Clone, Debug, PartialEq, FromEnv)]
 pub struct Config {
     pub kalshi_api_key_id: String,
@@ -38,10 +38,10 @@ pub struct Cli {
 /// How one recording runs.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CollectOptions {
-    /// Limits the first scan to this many markets, for a small run.
+    /// The most markets to place during the run.
     #[arg(long)]
     pub max_markets: Option<usize>,
-    /// The most markets one socket may hold.
+    /// The most markets per socket, exceeded only at the provider's socket limit.
     #[arg(long, default_value_t = 2000, value_parser = parse_positive)]
     pub markets_per_socket: usize,
     /// Independent copies of every market. With two or more, a lost socket
@@ -63,7 +63,7 @@ pub enum CliCommand {
     Discover,
     /// Follows one market's book until stopped.
     Watch { ticker: String },
-    /// Records all open markets until stopped.
+    /// Records open markets until stopped.
     Collect(CollectOptions),
     /// Decodes a recorded file and reports what it holds.
     Verify { path: PathBuf },
@@ -88,7 +88,7 @@ pub enum AppError {
     WriterStalled,
 }
 
-/// Zero sockets or feeds could never hold a market.
+/// A socket capacity or feed count of zero could hold no market.
 fn parse_positive(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(0) | Err(_) => Err("must be a whole number of at least 1".to_owned()),

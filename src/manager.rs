@@ -1,5 +1,5 @@
 //! Socket manager: decides which socket holds each market and keeps the
-//! sockets running. Sockets do the I/O; this module only places markets.
+//! sockets running. Sockets perform the I/O.
 
 use crate::provider::{MarketStream, StreamCommand, StreamHandler};
 use futures_util::future::join_all;
@@ -13,8 +13,8 @@ use tracing::{info, warn};
 /// How long sockets get to send a Close frame before they are aborted.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Runs every market on each of several independent feeds, so losing a socket
-/// never leaves a market without a live copy. Feeds share no sockets.
+/// Runs every market on each feed. With two or more feeds, losing one socket
+/// leaves its markets a live copy on another feed. Feeds share no sockets.
 pub struct SocketManager<S, H> {
     feeds: Vec<Feed<S, H>>,
 }
@@ -41,7 +41,8 @@ struct SocketHandle {
 
 impl<S: MarketStream, H: StreamHandler> SocketManager<S, H> {
     /// Creates a manager with one feed per handler and no sockets yet.
-    /// `capacity` is the most markets one socket may hold.
+    /// `capacity` is the most markets one socket holds until the socket limit
+    /// is reached, after which sockets are filled past it.
     pub fn new(template: S, capacity: usize, handlers: Vec<H>) -> Self {
         let socket_limit = (S::CONNECTION_LIMIT / handlers.len().max(1)).max(1);
         let feeds = handlers
@@ -77,8 +78,8 @@ impl<S: MarketStream, H: StreamHandler> SocketManager<S, H> {
         })
     }
 
-    /// Places every market not yet placed on every feed. Adding a placed
-    /// market changes nothing, so callers may overlap.
+    /// Places each of `symbols` on every feed. Adding a placed market changes
+    /// nothing, so callers may overlap.
     pub fn add(&mut self, symbols: Vec<String>) {
         for feed in &mut self.feeds {
             feed.add(symbols.clone());
@@ -93,15 +94,15 @@ impl<S: MarketStream, H: StreamHandler> SocketManager<S, H> {
         }
     }
 
-    /// Removes every placed market from every feed.
+    /// Removes each of `symbols` from every feed.
     pub fn remove(&mut self, symbols: Vec<String>) {
         for feed in &mut self.feeds {
             feed.remove(symbols.clone());
         }
     }
 
-    /// Closes every socket. A socket still reconnecting is aborted after the
-    /// timeout, because it has nothing to close.
+    /// Closes every socket. A socket that has not finished within
+    /// `CLOSE_TIMEOUT`, such as one still reconnecting, is aborted.
     pub async fn close(self) {
         let closing = self.feeds.into_iter().map(Feed::close);
         if timeout(CLOSE_TIMEOUT, join_all(closing)).await.is_err() {
@@ -111,8 +112,8 @@ impl<S: MarketStream, H: StreamHandler> SocketManager<S, H> {
 }
 
 impl<S: MarketStream, H: StreamHandler> Feed<S, H> {
-    /// Places every market not yet placed on the least-loaded socket with
-    /// room.
+    /// Places each of `symbols` not yet placed. Prefers the least-loaded socket
+    /// with room, then a new socket, then overfilling.
     fn add(&mut self, mut symbols: Vec<String>) {
         symbols.retain(|symbol| !self.placement.contains_key(symbol));
         symbols.sort_unstable();
@@ -137,7 +138,7 @@ impl<S: MarketStream, H: StreamHandler> Feed<S, H> {
         }
     }
 
-    /// Removes every placed market from its socket.
+    /// Removes each placed market in `symbols` from its socket.
     fn remove(&mut self, symbols: Vec<String>) {
         let mut by_socket: HashMap<usize, Vec<String>> = HashMap::new();
         for symbol in symbols {

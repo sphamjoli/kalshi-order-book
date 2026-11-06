@@ -1,7 +1,7 @@
-//! Market tracking: finds markets and keeps the socket manager in step as they
-//! open and close, using short time-filtered polls, with a periodic full scan
-//! to catch anything they miss. Removal needs a closed or settled listing or a
-//! complete scan, so a failed scan removes nothing.
+//! Market tracking: finds markets and updates the socket manager as they open
+//! and close. Short time-filtered polls report changes, and a periodic full
+//! scan finds what they miss. Removal needs a closed listing or a complete
+//! scan, so a failed scan removes nothing.
 
 use crate::manager::SocketManager;
 use crate::provider::{
@@ -18,11 +18,12 @@ use tracing::{info, warn};
 /// Overlap between polls, so a market on the boundary is not missed. Adding
 /// or removing a market twice changes nothing.
 const POLL_OVERLAP_SECONDS: i64 = 60;
-/// A rescan below one over this share of the placed markets is not believed.
+/// A rescan that finds fewer than 1/`MIN_RESCAN_FRACTION` of the placed markets
+/// removes nothing.
 const MIN_RESCAN_FRACTION: usize = 2;
 const MAX_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-/// Where polling has got to.
+/// The state carried between polls.
 struct PollState {
     since: i64,
     /// Listed markets waiting to open, by opening time.
@@ -31,7 +32,7 @@ struct PollState {
     max_markets: Option<usize>,
 }
 
-/// Keeps the placed markets in step with the exchange.
+/// Updates the placed markets from the exchange's listings.
 pub struct MarketTracker<'a, D> {
     directory: &'a D,
     poll_interval: Duration,
@@ -50,10 +51,10 @@ impl<'a, D: MarketDirectory> MarketTracker<'a, D> {
     }
 
     /// Places markets as the first scan finds them, because a full scan takes
-    /// far too long to wait for, then follows changes until dropped. A failed
-    /// scan starts again, and markets already placed keep running.
-    /// `max_markets` holds for the whole run, and a limited run never rescans,
-    /// because a rescan exists to place every market.
+    /// too long to wait for, then follows changes until dropped. A failed scan
+    /// starts again, and markets already placed keep running. `max_markets`
+    /// holds for the whole run. A limited run never rescans, because a rescan
+    /// places every open market regardless of the limit.
     pub async fn run<S: MarketStream, H: StreamHandler>(
         &self,
         manager: &mut SocketManager<S, H>,
@@ -108,8 +109,8 @@ impl<'a, D: MarketDirectory> MarketTracker<'a, D> {
         manager.add(state.within_limit(manager, due));
     }
 
-    /// A failed refresh keeps what is already scheduled, and the next one
-    /// fills any gap.
+    /// A failed refresh keeps what is already scheduled. The refresh after the
+    /// next rescan fills any gap, and a limited run does not rescan.
     async fn refresh_upcoming(&self, state: &mut PollState) {
         match self.directory.upcoming_markets().await {
             Ok(markets) => state.schedule(markets),
@@ -117,10 +118,10 @@ impl<'a, D: MarketDirectory> MarketTracker<'a, D> {
         }
     }
 
-    /// Catches anything the polls missed. Polling continues during the scan,
-    /// and only markets placed before it began can be removed, because a
-    /// later one may be missing from pages already fetched. A failed scan
-    /// changes nothing.
+    /// Finds what the polls missed. Polling continues during the scan, and
+    /// only markets placed before it began can be removed, because a later one
+    /// may be missing from pages already fetched. The result of a failed scan
+    /// is discarded.
     async fn rescan<S: MarketStream, H: StreamHandler>(
         &self,
         manager: &mut SocketManager<S, H>,
@@ -144,8 +145,8 @@ impl<'a, D: MarketDirectory> MarketTracker<'a, D> {
     }
 
     /// Markets that polls removed during the scan stay removed, though an
-    /// early page may still list them. A scan far smaller than what is placed
-    /// looks like an exchange fault, so it removes nothing.
+    /// early page may still list them. A scan below the `MIN_RESCAN_FRACTION`
+    /// threshold is treated as an exchange fault and removes nothing.
     fn reconcile<S: MarketStream, H: StreamHandler>(
         &self,
         manager: &mut SocketManager<S, H>,
@@ -185,7 +186,7 @@ impl<'a, D: MarketDirectory> MarketTracker<'a, D> {
         max_markets: Option<usize>,
     ) -> Result<(), D::Error> {
         let limit = max_markets.unwrap_or(usize::MAX);
-        // A retried scan continues from what the failed one placed.
+        // A retried scan counts what the failed one placed against the limit.
         let mut total = manager.market_count().min(limit);
         self.directory
             .scan_open(|mut page| {
@@ -222,14 +223,13 @@ impl PollState {
         }
     }
 
-    /// Takes the markets whose opening time has passed.
+    /// Takes the markets whose opening time has been reached.
     fn take_due(&mut self, now: i64) -> Vec<String> {
         let later = self.upcoming.split_off(&(now + 1));
         let due = std::mem::replace(&mut self.upcoming, later);
         due.into_values().flatten().collect()
     }
 
-    /// Keeps a limited run within its limit.
     fn within_limit<S: MarketStream, H: StreamHandler>(
         &self,
         manager: &SocketManager<S, H>,

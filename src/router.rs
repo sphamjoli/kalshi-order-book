@@ -45,8 +45,8 @@ impl FeedRouter {
             .expect("a panic while routing leaves ownership unknown")
     }
 
-    /// Blocking is the back-pressure, so it is only paid for when the queue
-    /// is full. A closed queue means the writer failed.
+    /// Blocks only when the queue is full, which applies back-pressure. A
+    /// closed queue means the writer failed.
     fn send(&self, record: OutputRecord) {
         let sent = match self.records.try_send(record) {
             Err(TrySendError::Full(record)) => {

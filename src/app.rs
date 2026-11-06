@@ -1,5 +1,5 @@
-//! The application: builds its dependencies once, runs one command, and stops
-//! when a shutdown is requested.
+//! The application: builds its dependencies once and runs one command until it
+//! finishes or a shutdown is requested.
 
 use crate::collector::{Collector, CollectorOutput};
 use crate::discovery::MarketTracker;
@@ -23,8 +23,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-/// Records held for the writer. A full queue slows the sockets. This counts
-/// records, not bytes, so the memory it allows depends on book sizes.
+/// Records held for the writer. A full queue blocks the sending feed. The
+/// capacity is a record count, so its memory use depends on book sizes.
 const OUTPUT_QUEUE_CAPACITY: usize = 65_536;
 /// How often new and closed markets are looked up.
 const MARKET_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -35,7 +35,7 @@ const MARKET_RESCAN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SAMPLE_SIZE: usize = 5;
 
-/// The running program.
+/// The provider clients and shutdown token of one run.
 pub struct App {
     kalshi: KalshiClient,
     stream: KalshiStream,
@@ -43,11 +43,11 @@ pub struct App {
 }
 
 impl App {
-    /// Loads the signing key and builds the Kalshi client.
+    /// Loads the signing key and builds the Kalshi client and stream.
     ///
     /// # Errors
     /// Returns an [`AppError`] when the key cannot be read or used, or the
-    /// client cannot be built.
+    /// client or stream cannot be built.
     pub fn new(config: &Config) -> Result<Self, AppError> {
         let pem = std::fs::read_to_string(&config.kalshi_private_key_path)?;
         let signer: Arc<dyn RequestSigner> = Arc::new(DefaultRequestSigner::from_pem(
@@ -105,8 +105,9 @@ impl App {
         }
     }
 
-    /// On shutdown, closes every socket and then waits for the writer to
-    /// drain, so accepted records reach the file and it ends on a whole chunk.
+    /// On shutdown, closes every socket and then waits up to
+    /// `WRITER_DRAIN_TIMEOUT` for the writer to drain, so that queued records
+    /// reach the file and it ends on a whole chunk.
     async fn collect<D: MarketDirectory, S: MarketStream>(
         &self,
         directory: &D,

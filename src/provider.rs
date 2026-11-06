@@ -1,7 +1,7 @@
-//! The contracts a market data provider implements. Everything outside a
-//! provider's own module depends on these, so adding a provider means
-//! implementing them and choosing it in the application, with no change to
-//! placement, tracking, books, failover or output.
+//! The contracts a market data provider implements. Placement, tracking,
+//! books, failover and output depend on these and not on a provider's module,
+//! so adding a provider means implementing them and choosing it in the
+//! application.
 
 use crate::collector::{Collector, CollectorOutput};
 use chrono::{DateTime, Utc};
@@ -94,7 +94,7 @@ pub trait MarketDirectory {
         on_page: impl FnMut(Vec<String>) -> ControlFlow<()>,
     ) -> impl Future<Output = Result<(), Self::Error>>;
 
-    /// Returns what opened and closed at or after `since`, in Unix seconds.
+    /// Returns what changed at or after `since`, in Unix seconds.
     fn changes_since(&self, since: i64)
     -> impl Future<Output = Result<MarketChanges, Self::Error>>;
 

@@ -4,8 +4,8 @@ use rand::RngExt;
 use std::time::Duration;
 use url::Url;
 
-/// Returns whether a URL protects its traffic. Plain schemes are allowed only
-/// on loopback, for local test servers.
+/// Returns whether a URL may be used. It must have a TLS scheme or name a
+/// loopback host, which permits plain schemes for local test servers.
 pub fn is_secure(url: &Url) -> bool {
     matches!(url.scheme(), "https" | "wss")
         || matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
@@ -17,14 +17,14 @@ pub fn with_jitter(delay: Duration) -> Duration {
     delay + delay.mul_f64(rand::rng().random_range(0.0..0.5))
 }
 
-/// Returns a random delay of up to `delay`, which spreads a crowd of retries
-/// the most widely.
+/// Returns a random delay below `delay`, the widest spread for simultaneous
+/// retries.
 pub fn full_jitter(delay: Duration) -> Duration {
     delay.mul_f64(rand::rng().random_range(0.0..1.0))
 }
 
-/// Returns a random delay between `floor` and `delay`. Retries spread widely,
-/// and the floor stops a failing peer being retried at once.
+/// Returns a random delay between `floor` and `delay`. The floor prevents an
+/// immediate retry of a failing peer.
 pub fn spread(delay: Duration, floor: Duration) -> Duration {
     floor + full_jitter(delay.saturating_sub(floor))
 }
