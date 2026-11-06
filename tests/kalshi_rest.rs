@@ -1,4 +1,4 @@
-//! REST client behaviour against a local mock server; never touches the network.
+//! REST client behaviour against a local mock server.
 
 use engineering_challenge::kalshi::auth::{
     AuthHeaders, KEY_HEADER, RequestSigner, SIGNATURE_HEADER, TIMESTAMP_HEADER, auth_header_map,

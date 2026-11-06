@@ -310,9 +310,9 @@ fn a_stalled_owner_cannot_cost_a_market_its_minute_snapshot() {
     assert!(failover.route(PRIMARY, &primary, &stale).is_none());
     let current = backup.snapshot("M").unwrap();
     assert!(failover.route(BACKUP, &backup, &current).is_some());
-    // The standby now owns the market, so the next minute is its too.
+    // The standby now owns the market, so its next snapshot also passes.
     assert!(failover.route(BACKUP, &backup, &current).is_some());
-    // The old owner catching up is a standby, so its minute is not repeated.
+    // The old owner is now a standby, so its snapshot is not recorded.
     feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11));
     let caught_up = primary.snapshot("M").unwrap();
     assert!(failover.route(PRIMARY, &primary, &caught_up).is_none());

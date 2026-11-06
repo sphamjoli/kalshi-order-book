@@ -1,4 +1,4 @@
-//! Stream behaviour against a local WebSocket server; never touches the network.
+//! Stream behaviour against a local WebSocket server.
 
 use chrono::{DateTime, Utc};
 use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};

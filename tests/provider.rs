@@ -1,5 +1,5 @@
 //! A second provider, built only from the public contracts, runs through the
-//! real tracker and manager without either knowing it.
+//! real tracker and manager.
 
 use chrono::{DateTime, Utc};
 use engineering_challenge::collector::{Collector, CollectorOutput};

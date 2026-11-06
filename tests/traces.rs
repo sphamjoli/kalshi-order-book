@@ -1,4 +1,4 @@
-//! End-to-end behavioural traces of the collector.
+//! Behavioural traces through the normaliser and collector.
 
 use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::domain::{Level, MarketEvent, Price, Quantity};
@@ -87,8 +87,6 @@ fn bids_only_snapshot_clears_old_asks() {
     assert!(asks.is_empty());
 }
 
-// Trace: Quantity 7, signed change -2, then -5
-// Expected: Output absolute 5 then 0, remove stored level
 // Trace: One delta in a subscription is missing
 // Expected: Every dependent replica becomes invalid; no authoritative periodic snapshot from it
 #[test]

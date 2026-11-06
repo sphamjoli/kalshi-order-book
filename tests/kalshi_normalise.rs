@@ -158,7 +158,7 @@ fn a_jump_a_repeat_or_a_step_back_loses_continuity() {
         assert_eq!(event, Some(MarketEvent::ContinuityLost), "{next}");
     }
 
-    // The mark never falls, so a replay cannot look contiguous.
+    // The recorded `seq` never falls, so a replay cannot look contiguous.
     let mut normaliser = subscribed();
     let mut feed = |seq| {
         normaliser
