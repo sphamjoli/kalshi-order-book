@@ -62,6 +62,7 @@ fn snapshot_maps_yes_to_bids_and_mirrors_no_to_asks() {
         MarketEvent::Snapshot {
             symbol: "M".to_owned(),
             exchange_time_ms: 9,
+            exchange_clock: Some(1),
             bids: vec![level(80_000, 300_000_000)],
             asks: vec![level(450_000, 7_000_000)],
         }
@@ -111,6 +112,9 @@ fn bad_numbers_are_rejected() {
     for price in ["1.000001", "-0.01", "abc", ""] {
         assert!(is_invalid(&delta_frame(3, "yes", price, "1.00")), "{price}");
     }
+    for text in ["1_0.00", "0_.5", "+1.00", ".5", "5.", "1e2", " 1.0", "1.0 "] {
+        assert!(is_invalid(&delta_frame(3, "yes", "0.5", text)), "{text}");
+    }
     assert!(is_invalid(&delta_frame(
         3,
         "yes",
@@ -153,6 +157,17 @@ fn a_jump_a_repeat_or_a_step_back_loses_continuity() {
             .unwrap();
         assert_eq!(event, Some(MarketEvent::ContinuityLost), "{next}");
     }
+
+    // The mark never falls, so a replay cannot look contiguous.
+    let mut normaliser = subscribed();
+    let mut feed = |seq| {
+        normaliser
+            .normalise(&delta_frame(seq, "yes", "0.5", "1.00"))
+            .unwrap()
+    };
+    feed(10);
+    assert_eq!(feed(3), Some(MarketEvent::ContinuityLost));
+    assert_eq!(feed(4), Some(MarketEvent::ContinuityLost));
 }
 
 #[test]
@@ -195,26 +210,6 @@ fn a_book_frame_on_an_unannounced_subscription_is_rejected() {
         .normalise(&delta_frame(3, "yes", "0.5", "1.00"))
         .unwrap_err();
     assert!(matches!(error, NormaliseError::UnknownSubscription(2)));
-}
-
-#[test]
-fn a_replay_after_a_backward_step_cannot_look_contiguous() {
-    let mut normaliser = subscribed();
-    let mut feed = |seq| {
-        normaliser
-            .normalise(&delta_frame(seq, "yes", "0.5", "1.00"))
-            .unwrap()
-    };
-    feed(10);
-    assert_eq!(feed(3), Some(MarketEvent::ContinuityLost));
-    assert_eq!(feed(4), Some(MarketEvent::ContinuityLost));
-}
-
-#[test]
-fn non_canonical_numbers_are_rejected() {
-    for text in ["1_0.00", "0_.5", "+1.00", ".5", "5.", "1e2", " 1.0", "1.0 "] {
-        assert!(is_invalid(&delta_frame(3, "yes", "0.5", text)), "{text}");
-    }
 }
 
 #[test]
@@ -280,4 +275,37 @@ fn commands_match_the_documented_shape() {
 fn a_rejected_command_leaves_the_books_alone() {
     let frame = json!({ "type": "error", "id": 9, "msg": { "code": 8 } }).to_string();
     assert_eq!(subscribed().normalise(&frame).unwrap(), None);
+}
+
+#[test]
+fn a_missing_time_falls_back_and_never_costs_the_book() {
+    let frame = delta_frame(3, "yes", "0.5", "1.00").replace(",\"ts_ms\":7", "");
+    let event = subscribed().normalise(&frame).unwrap();
+    let Some(MarketEvent::Delta {
+        exchange_time_ms, ..
+    }) = event
+    else {
+        panic!("expected a delta, got {event:?}");
+    };
+    assert_eq!(exchange_time_ms, 5, "the sending time stands in");
+
+    let frame = frame.replace("\"sending_ts_ms\":5,", "");
+    let event = subscribed().normalise(&frame).unwrap();
+    assert!(matches!(event, Some(MarketEvent::Delta { .. })));
+}
+
+#[test]
+fn a_delta_carries_the_exchange_clock() {
+    let frame = delta_frame(3, "yes", "0.5", "1.00").replace("\"clock\":1", "\"clock\":42");
+    let event = subscribed().normalise(&frame).unwrap();
+    assert!(
+        matches!(
+            event,
+            Some(MarketEvent::Delta {
+                exchange_clock: Some(42),
+                ..
+            })
+        ),
+        "{event:?}"
+    );
 }

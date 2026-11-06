@@ -74,6 +74,9 @@ pub enum MarketEvent {
     Snapshot {
         symbol: String,
         exchange_time_ms: i64,
+        /// The exchange's own ordering of this market's changes, the same on
+        /// every connection, if it has one.
+        exchange_clock: Option<u64>,
         bids: Vec<Level>,
         asks: Vec<Level>,
     },
@@ -81,6 +84,9 @@ pub enum MarketEvent {
     Delta {
         symbol: String,
         exchange_time_ms: i64,
+        /// The exchange's own ordering of this market's changes, the same on
+        /// every connection, if it has one.
+        exchange_clock: Option<u64>,
         side: Side,
         price: Price,
         delta: QuantityDelta,

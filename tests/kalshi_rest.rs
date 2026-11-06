@@ -73,15 +73,6 @@ async fn trailing_slash_on_the_base_url_changes_nothing() {
 }
 
 #[tokio::test]
-async fn refused_credentials_are_a_distinct_error() {
-    for status in [401, 403] {
-        let (_server, client) = server(ResponseTemplate::new(status)).await;
-        let error = client.account_limits().await.unwrap_err();
-        assert!(matches!(error, RestError::Unauthorized));
-    }
-}
-
-#[tokio::test]
 async fn other_failures_report_only_the_status() {
     let (_server, client) =
         server(ResponseTemplate::new(404).set_body_string("private body")).await;
@@ -306,18 +297,6 @@ async fn a_rate_limited_page_is_retried() {
     assert_eq!(tickers(&markets), ["A"]);
 }
 
-#[tokio::test]
-async fn refused_credentials_are_not_retried() {
-    let (server, client) = markets_server().await;
-    first_page()
-        .respond_with(ResponseTemplate::new(401))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let error = client.markets(MarketQuery::Open).await.unwrap_err();
-    assert!(matches!(error, RestError::Unauthorized));
-}
-
 #[test]
 fn signature_header_is_marked_sensitive() {
     let headers = auth_header_map(&EchoSigner.sign(1, "GET", "/a")).unwrap();
@@ -336,4 +315,18 @@ async fn an_oversized_body_is_rejected() {
     let (_server, client) = server(ResponseTemplate::new(200).set_body_bytes(body)).await;
     let error = client.account_limits().await.unwrap_err();
     assert!(matches!(error, RestError::OversizedBody));
+}
+
+#[tokio::test]
+async fn refused_credentials_are_a_distinct_error_and_never_retried() {
+    for status in [401, 403] {
+        let (server, client) = markets_server().await;
+        first_page()
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client.markets(MarketQuery::Open).await.unwrap_err();
+        assert!(matches!(error, RestError::Unauthorized), "{status}");
+    }
 }

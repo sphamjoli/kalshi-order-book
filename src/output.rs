@@ -4,7 +4,7 @@
 //! stderr. Per-market order is guaranteed; global time order across markets is
 //! not promised.
 
-use crate::collector::CollectorOutput;
+use crate::collector::BookRecord;
 use crate::util::dtos::SbeEncode;
 use crate::util::dtos::challenge_orderbook::sbe_rt::DecodeError;
 use crate::util::dtos::challenge_orderbook::{
@@ -39,7 +39,7 @@ pub enum OutputError {
 /// A collector result with its local receipt time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRecord {
-    pub output: CollectorOutput,
+    pub output: BookRecord,
     pub received_at: DateTime<Utc>,
 }
 
@@ -68,18 +68,18 @@ impl SbeOutput {
         })
     }
 
-    /// Writes one record. Resync and release notices are not data, so they
-    /// write nothing.
+    /// Writes one record.
     ///
     /// # Errors
     /// Returns an [`OutputError`] when encoding or the sink fails.
     pub fn write(&mut self, record: &OutputRecord) -> Result<(), OutputError> {
         match &record.output {
-            CollectorOutput::Snapshot {
+            BookRecord::Snapshot {
                 symbol,
                 exchange_time_ms,
                 bids,
                 asks,
+                ..
             } => self.encode(&SnapshotDomain {
                 received_at: record.received_at,
                 exchange_timestamp: exchange_time(*exchange_time_ms)?,
@@ -99,10 +99,11 @@ impl SbeOutput {
                     .collect(),
                 symbol: symbol.clone(),
             }),
-            CollectorOutput::Update {
+            BookRecord::Update {
                 symbol,
                 exchange_time_ms,
                 change,
+                ..
             } => self.encode(&PriceLevelUpdateDomain {
                 backtest_timestamp: record.received_at,
                 exchange_timestamp: exchange_time(*exchange_time_ms)?,
@@ -111,7 +112,6 @@ impl SbeOutput {
                 side: change.side,
                 symbol: symbol.clone(),
             }),
-            CollectorOutput::Resync(_) | CollectorOutput::Released(_) => Ok(()),
         }
     }
 

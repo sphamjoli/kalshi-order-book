@@ -2,22 +2,23 @@
 //! when a shutdown is requested.
 
 use crate::collector::{Collector, CollectorOutput};
-use crate::failover::Failover;
+use crate::discovery::MarketTracker;
+use crate::failover::{Failover, FeedId};
 use crate::kalshi::auth::{DefaultRequestSigner, RequestSigner};
-use crate::kalshi::discovery::MarketTracker;
-use crate::kalshi::manager::SocketManager;
 use crate::kalshi::rest::{KalshiClient, MarketQuery};
 use crate::kalshi::stream::{DEFAULT_TIMING, KalshiStream};
-use crate::output::{self, OutputRecord};
+use crate::manager::SocketManager;
+use crate::output;
+use crate::provider::{MarketDirectory, MarketStream};
+use crate::router::FeedRouter;
 use crate::types::{AppError, CliCommand, CollectOptions, Config};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, unbounded_channel};
-use tokio::task::{block_in_place, spawn_blocking};
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -92,58 +93,44 @@ impl App {
             CliCommand::Discover => self.discover().await,
             CliCommand::Watch { ticker } => {
                 let (_commands, receiver) = unbounded_channel();
-                let stream = self.stream.for_tickers(vec![ticker]);
+                let stream = self.stream.for_markets(vec![ticker]);
                 stream.run(receiver, log_top_of_book).await;
                 Ok(())
             }
-            CliCommand::Collect(options) => self.collect(options).await,
+            CliCommand::Collect(options) => {
+                self.collect(&self.kalshi, self.stream.clone(), options)
+                    .await
+            }
             CliCommand::Verify { path } => verify(&path),
         }
     }
 
     /// On shutdown, closes every socket and then waits for the writer to
     /// drain, so accepted records reach the file and it ends on a whole chunk.
-    async fn collect(&self, options: CollectOptions) -> Result<(), AppError> {
+    async fn collect<D: MarketDirectory, S: MarketStream>(
+        &self,
+        directory: &D,
+        stream: S,
+        options: CollectOptions,
+    ) -> Result<(), AppError> {
         let (sender, receiver) = channel(OUTPUT_QUEUE_CAPACITY);
         let path = options.output;
         let writer = spawn_blocking(move || output::write_records(receiver, &path));
         let failover = Arc::new(Mutex::new(Failover::default()));
         let handlers = (0..options.feeds)
             .map(|feed| {
-                let (failover, sender) = (failover.clone(), sender.clone());
-                let shutdown = self.shutdown.clone();
-                move |collector: &Collector, output: &CollectorOutput, received_at| {
-                    let routed = failover
-                        .lock()
-                        .expect("a panic while routing leaves ownership unknown")
-                        .route(feed, collector, output);
-                    let Some(output) = routed else {
-                        return;
-                    };
-                    let record = OutputRecord {
-                        output,
-                        received_at,
-                    };
-                    // Blocking is the back-pressure, so only pay for it when
-                    // the queue is full. A closed queue means the writer
-                    // failed, so the whole run must stop.
-                    let sent = match sender.try_send(record) {
-                        Err(TrySendError::Full(record)) => {
-                            block_in_place(|| sender.blocking_send(record)).is_ok()
-                        }
-                        other => other.is_ok(),
-                    };
-                    if !sent {
-                        shutdown.cancel();
-                    }
-                }
+                let feed = FeedId(feed);
+                FeedRouter::new(
+                    feed,
+                    failover.clone(),
+                    sender.clone(),
+                    self.shutdown.clone(),
+                )
             })
             .collect();
         drop(sender);
-        let mut manager =
-            SocketManager::new(self.stream.clone(), options.markets_per_socket, handlers);
-        let tracker =
-            MarketTracker::new(&self.kalshi, MARKET_POLL_INTERVAL, MARKET_RESCAN_INTERVAL);
+        let mut manager = SocketManager::new(stream, options.markets_per_socket, handlers);
+        let tracker = MarketTracker::new(directory, MARKET_POLL_INTERVAL, MARKET_RESCAN_INTERVAL);
         let fed = tokio::select! {
             () = tracker.run(&mut manager, options.max_markets) => Ok(()),
             stopped = self.shutdown_requested() => stopped.map_err(AppError::from),
