@@ -1,4 +1,4 @@
-//! Kalshi WebSocket message shapes, exactly as sent. Decimal fields stay as
+//! Kalshi WebSocket message shapes. Decimal fields stay as
 //! strings here; [`super::normalise`] owns their conversion.
 //!
 //! Format: <https://docs.kalshi.com/websockets/orderbook-updates>, read

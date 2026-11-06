@@ -39,7 +39,7 @@ fn tickers(markets: Vec<Market>) -> Vec<String> {
     markets.into_iter().map(|market| market.ticker).collect()
 }
 
-/// A market without an open time cannot be scheduled. The periodic scan finds
+/// A market without a valid open time cannot be scheduled. The periodic scan finds
 /// it once it is open.
 fn upcoming_markets(markets: Vec<Market>) -> Vec<UpcomingMarket> {
     markets

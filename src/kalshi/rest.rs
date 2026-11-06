@@ -21,11 +21,11 @@ const ACCOUNT_LIMITS_PATH: &str = "account/limits";
 const MARKETS_PATH: &str = "markets";
 /// The largest page `GET /markets` accepts.
 const MARKETS_PAGE_LIMIT: usize = 1000;
-/// Stops a server that never ends a scan. A real scan was about 181 pages.
+/// Bounds a scan that a server never ends. A real scan was about 181 pages.
 const MAX_MARKET_PAGES: usize = 1000;
 /// Long enough for a full page while every socket shares the same link.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Far above a real page, which stops a faulty server exhausting memory.
+/// Far above a real page. Bounds the memory a faulty server can consume.
 const MAX_BODY_BYTES: usize = 32 << 20;
 const RETRY: RetryPolicy = RetryPolicy {
     attempts: 5,
@@ -54,7 +54,7 @@ pub enum RestError {
     OversizedBody,
     #[error("market scan exceeded {MAX_MARKET_PAGES} pages")]
     TooManyPages,
-    /// A loop in the cursors would otherwise page forever.
+    /// A cursor loop would otherwise repeat pages up to `MAX_MARKET_PAGES`.
     #[error("Kalshi repeated a pagination cursor")]
     RepeatedCursor,
     #[error("response is not the expected JSON: {0}")]
@@ -71,8 +71,8 @@ pub struct KalshiClient {
     retry: RetryPolicy,
 }
 
-/// How one request is retried. Bounded, because a caller of a REST scan can
-/// start the whole scan again; it is not the policy for a live socket.
+/// How one request is retried. Attempts are bounded because a caller of a REST
+/// scan can start the whole scan again. A live socket uses a different policy.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub attempts: u32,
@@ -93,7 +93,7 @@ pub enum MarketQuery {
     /// Closed markets that closed at or after this time.
     ClosedSince(i64),
     /// Settled markets that settled at or after this time. A market can close
-    /// and settle between two polls, leaving it on neither other list.
+    /// and settle between two polls, which leaves it off the `ClosedSince` list.
     SettledSince(i64),
 }
 
@@ -147,8 +147,9 @@ impl KalshiClient {
     ///
     /// # Errors
     /// Returns [`RestError::InvalidBaseUrl`] when `base_url` cannot be parsed,
-    /// [`RestError::InsecureBaseUrl`] when it is plain HTTP to another
-    /// machine, and [`RestError::Http`] when the HTTP client cannot be built.
+    /// [`RestError::InsecureBaseUrl`] when it is not `https` and its host is
+    /// not loopback, and [`RestError::Http`] when the HTTP client cannot be
+    /// built.
     pub fn try_new(base_url: &str, signer: Arc<dyn RequestSigner>) -> Result<Self, RestError> {
         let base_url = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))?;
         if !transport::is_secure(&base_url) {
@@ -172,8 +173,8 @@ impl KalshiClient {
         self
     }
 
-    /// Fetches the account's limits. This also proves the signature works,
-    /// because the endpoint requires authentication.
+    /// Fetches the account's limits. Success also confirms that the signature
+    /// is accepted, because the endpoint requires authentication.
     ///
     /// # Errors
     /// Returns [`RestError::Unauthorized`] when the credentials are refused,
@@ -183,8 +184,8 @@ impl KalshiClient {
     }
 
     /// Fetches every matching market, excluding multivariate ones. Returns
-    /// the whole set or an error, never a partial list, so a failed scan
-    /// cannot look like markets disappearing.
+    /// the whole set or an error, so a failed scan cannot look like markets
+    /// disappearing.
     ///
     /// # Errors
     /// Returns the same errors as [`Self::scan_markets`].

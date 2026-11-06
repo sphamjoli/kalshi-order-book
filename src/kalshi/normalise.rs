@@ -1,5 +1,6 @@
 //! Turns Kalshi frames into [`MarketEvent`]s: exact decimal scaling, NO-side
-//! mirroring and sequence tracking. Pure apart from the sequence state.
+//! mirroring and sequence tracking. The only state is the sequence tracking. A
+//! frame without an exchange time also reads the local clock.
 //!
 //! A NO bid at `p` is an offer to sell YES at `1 - p`, with the same quantity
 //! and the same delta sign:
@@ -46,7 +47,7 @@ pub enum NormaliseError {
 }
 
 /// Normalises the frames of one connection. `seq` is not comparable across
-/// connections, so each connection needs a new value.
+/// connections, so each connection needs a new `Normaliser`.
 #[derive(Debug, Default)]
 pub struct Normaliser {
     /// Highest `seq` per announced subscription; `None` before the first.
@@ -61,15 +62,15 @@ impl Normaliser {
     }
 
     /// Normalises one text frame. Returns `None` for a frame with no book
-    /// meaning. Fails closed: a frame after a gap is discarded, and a type
-    /// this code does not know could have changed a book, so both yield
-    /// [`MarketEvent::ContinuityLost`] and the replacement snapshot supersedes
+    /// meaning. A frame after a gap is discarded, and a frame of an unknown
+    /// type could have changed a book. Both yield
+    /// [`MarketEvent::ContinuityLost`], and the replacement snapshot supersedes
     /// them.
     ///
     /// # Errors
-    /// Returns a [`NormaliseError`] when the frame cannot be trusted,
-    /// including a book message without a position on an announced
-    /// subscription.
+    /// Returns a [`NormaliseError`] when the frame fails parsing or validation,
+    /// including a book message that lacks `sid` or `seq` or names an
+    /// unannounced subscription.
     pub fn normalise(&mut self, frame: &str) -> Result<Option<MarketEvent>, NormaliseError> {
         let envelope: Envelope = serde_json::from_str(frame)?;
         match envelope.kind {
@@ -124,9 +125,9 @@ impl Normaliser {
         build(envelope).map(Some)
     }
 
-    /// Records a position and returns whether it breaks the sequence. The
-    /// first frame sets the baseline, and a repeat or backward step counts as
-    /// a gap. The mark never falls, so a replay cannot look contiguous.
+    /// Records a `seq` and returns whether it breaks the sequence. The first
+    /// frame sets the baseline, and a repeat or backward step counts as a gap.
+    /// The recorded `seq` never falls, so a replay cannot look contiguous.
     fn advance(&mut self, sid: u64, seq: u64) -> Result<bool, NormaliseError> {
         let last = self
             .last_seq
@@ -174,13 +175,13 @@ fn parse_body<'a, T: serde::Deserialize<'a>>(
 }
 
 /// Kalshi documents its timestamps as optional, and a missing one says nothing
-/// about the book, so the local time stands in rather than costing a resync.
+/// about the book, so the local time is used and no resync is requested.
 fn exchange_time(ms: Option<i64>) -> Result<i64, NormaliseError> {
     checked_time(ms.unwrap_or_else(|| Utc::now().timestamp_millis()))
 }
 
-/// Rejects a time the output format cannot hold, so one bad frame costs a
-/// resync rather than the whole run.
+/// Rejects a time the output format cannot hold, so a bad frame causes a resync
+/// and does not end the run.
 fn checked_time(ms: i64) -> Result<i64, NormaliseError> {
     if ms < 0 || DateTime::from_timestamp_millis(ms).is_none() {
         return Err(NormaliseError::InvalidTime(ms));

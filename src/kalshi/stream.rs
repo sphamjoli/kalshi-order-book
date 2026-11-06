@@ -1,8 +1,9 @@
 //! Kalshi WebSocket stream: connects, subscribes, and drives the normaliser
 //! and collector. Sequence numbers are not comparable across connections, so
-//! every connection starts with fresh state and fresh snapshots. It never gives
-//! up on a live market: a lost connection only slows down, up to a capped
-//! delay. Dropping the command sender closes it cleanly.
+//! every connection starts with fresh state and fresh snapshots. Reconnection
+//! continues until the command channel closes, with a delay that grows to a
+//! cap. The stream reads that channel only on a connection that can accept
+//! commands, and then sends a Close frame and stops.
 //!
 //! Handshake signing: <https://docs.kalshi.com/getting_started/quick_start_websockets>.
 
@@ -28,7 +29,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{info, trace, warn};
 use url::Url;
 
-/// Timing used outside tests. Kalshi pings every 10 seconds, so 30 seconds of
+/// Default timing. Kalshi pings every 10 seconds, so 30 seconds of
 /// silence means three missed pings.
 pub const DEFAULT_TIMING: StreamTiming = StreamTiming {
     silence_limit: Duration::from_secs(30),
@@ -68,7 +69,8 @@ pub enum StreamError {
 /// The durations that govern one stream.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamTiming {
-    /// How long a connection may stay silent. Pings count as traffic.
+    /// How long a connection may stay silent. Pings count as traffic. Also
+    /// bounds the handshake, each send and the Close frame.
     pub silence_limit: Duration,
     /// How often unanswered snapshot requests are sent again.
     pub resync_retry: Duration,
@@ -78,11 +80,12 @@ pub struct StreamTiming {
     pub crossed_grace: Duration,
     /// How often every live book is recorded in full.
     pub snapshot_interval: Duration,
-    /// How long a connection lives before it is replaced, which guards
-    /// against bugs that build up on either side of it. Jitter is added so
+    /// How long a connection lives before it is replaced, which limits faults
+    /// that accumulate over its lifetime on either side. Jitter is added so
     /// sockets do not all reconnect together.
     pub recycle_interval: Duration,
-    /// The first delay before reconnecting. It doubles on each failure.
+    /// The shortest reconnect delay. The upper bound from which each delay is
+    /// drawn doubles on each failure.
     pub reconnect_base: Duration,
     /// The longest reconnect delay, and how long a connection must last to
     /// count as recovered.

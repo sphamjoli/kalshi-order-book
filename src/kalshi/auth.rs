@@ -1,6 +1,6 @@
-//! Kalshi request signing. Owns the private key; callers only see the headers
-//! produced for one request. Signatures are per request, so nothing here is a
-//! session: sign again for every HTTP call and every WebSocket handshake.
+//! Kalshi request signing. This module owns the private key, and callers see
+//! only the headers produced for one request. Each HTTP call and each WebSocket
+//! handshake needs its own signature.
 //!
 //! Scheme: <https://docs.kalshi.com/getting_started/api_keys>, read November
 //! 2026. A WebSocket handshake signs `GET` and `/trade-api/ws/v2`, per
@@ -30,12 +30,12 @@ pub enum AuthError {
 
 /// Produces the authentication headers for one exchange request.
 pub trait RequestSigner: Send + Sync {
-    /// Signs one request. The caller supplies the time and owns the clock.
+    /// Signs one request at the time the caller supplies.
     fn sign(&self, timestamp_ms: i64, method: &str, path: &str) -> AuthHeaders;
 }
 
 /// Holds an Ed25519 key. Kalshi selects the verification algorithm from the
-/// registered public key, so an RSA PEM is rejected rather than misused.
+/// registered public key. This signer rejects an RSA PEM.
 pub struct DefaultRequestSigner {
     key_id: String,
     key: SigningKey,
@@ -95,8 +95,8 @@ impl std::fmt::Debug for AuthHeaders {
     }
 }
 
-/// Builds the request headers, marking the signature as sensitive so that
-/// HTTP and WebSocket clients keep it out of their debug output.
+/// Builds the request headers, marking the signature as sensitive so that its
+/// `Debug` output is redacted.
 ///
 /// # Errors
 /// Returns an error when a value is not a valid header value.

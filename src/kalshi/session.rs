@@ -1,5 +1,6 @@
-//! One Kalshi connection's state: frames in, commands out. Sequence numbers
-//! mean nothing beyond a connection, so this lives and dies with its socket.
+//! The state of one Kalshi connection, which reads frames and sends commands.
+//! Sequence numbers are valid only within a connection, so this state is
+//! discarded with its socket.
 
 use crate::collector::{Collector, CollectorOutput};
 use crate::domain::MarketEvent;
@@ -43,7 +44,7 @@ impl Session {
     }
 
     /// Changes the set first, so that if the command cannot be sent, the next
-    /// connection subscribes to the right markets anyway.
+    /// connection subscribes to the right markets.
     pub(super) async fn apply(
         &mut self,
         command: StreamCommand,
@@ -85,8 +86,8 @@ impl Session {
         id
     }
 
-    /// Sends a Close frame. The connection is ending either way, so a failure
-    /// here changes nothing.
+    /// Sends a Close frame. The connection is ending, so a failure is only
+    /// logged.
     pub(super) async fn close(&mut self) {
         match timeout(self.io_timeout, self.socket.close(None)).await {
             Ok(Ok(())) => {}
@@ -96,7 +97,7 @@ impl Session {
     }
 
     /// An unusable frame may have carried a book change, so it counts as lost
-    /// continuity rather than as nothing.
+    /// continuity.
     pub(super) async fn on_text(
         &mut self,
         text: &str,
@@ -140,7 +141,8 @@ impl Session {
     }
 
     /// A failed send ends the connection, so a lost command cannot go unseen.
-    /// The timeout matters because this runs outside the watchdog's select.
+    /// The timeout is required because the silence branch of the stream's
+    /// select cannot fire while this call is pending.
     pub(super) async fn send(&mut self, command: String) -> Result<(), StreamError> {
         timeout(
             self.io_timeout,
