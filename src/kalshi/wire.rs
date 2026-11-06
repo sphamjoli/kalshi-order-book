@@ -50,6 +50,7 @@ pub struct WireLevel {
 #[derive(Debug, Deserialize)]
 pub struct SnapshotBody {
     pub market_ticker: String,
+    pub clock: Option<u64>,
     #[serde(default)]
     pub yes_dollars_fp: Vec<WireLevel>,
     #[serde(default)]
@@ -60,10 +61,12 @@ pub struct SnapshotBody {
 #[derive(Debug, Deserialize)]
 pub struct DeltaBody {
     pub market_ticker: String,
+    pub clock: Option<u64>,
     pub price_dollars: String,
     pub delta_fp: String,
     pub side: ContractSide,
-    pub ts_ms: i64,
+    /// Kalshi documents this as optional.
+    pub ts_ms: Option<i64>,
 }
 
 /// The binary contract a level belongs to. Both sides are bids.

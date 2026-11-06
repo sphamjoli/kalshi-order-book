@@ -11,7 +11,7 @@ use crate::kalshi::wire::{
     ContractSide, DELTA_TYPE, DeltaBody, ERROR_TYPE, Envelope, OK_TYPE, SNAPSHOT_TYPE,
     SUBSCRIBED_TYPE, SnapshotBody, SubscribedBody, WireLevel,
 };
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
@@ -140,13 +140,11 @@ impl Normaliser {
 
 fn snapshot_event(envelope: &Envelope) -> Result<MarketEvent, NormaliseError> {
     let body: SnapshotBody = parse_body(envelope, SNAPSHOT_TYPE)?;
-    let exchange_time_ms = envelope
-        .sending_ts_ms
-        .ok_or(NormaliseError::MissingField(SNAPSHOT_TYPE, "sending_ts_ms"))?;
-    let exchange_time_ms = checked_time(exchange_time_ms)?;
+    let exchange_time_ms = exchange_time(envelope.sending_ts_ms)?;
     Ok(MarketEvent::Snapshot {
         symbol: body.market_ticker,
         exchange_time_ms,
+        exchange_clock: body.clock,
         bids: levels(&body.yes_dollars_fp, ContractSide::Yes)?,
         asks: levels(&body.no_dollars_fp, ContractSide::No)?,
     })
@@ -157,7 +155,8 @@ fn delta_event(envelope: &Envelope) -> Result<MarketEvent, NormaliseError> {
     let (side, price) = to_book_side(body.side, parse_price(&body.price_dollars)?)?;
     Ok(MarketEvent::Delta {
         symbol: body.market_ticker,
-        exchange_time_ms: checked_time(body.ts_ms)?,
+        exchange_time_ms: exchange_time(body.ts_ms.or(envelope.sending_ts_ms))?,
+        exchange_clock: body.clock,
         side,
         price,
         delta: QuantityDelta::new(scale(&body.delta_fp)?),
@@ -172,6 +171,12 @@ fn parse_body<'a, T: serde::Deserialize<'a>>(
         .msg
         .ok_or(NormaliseError::MissingField(kind, "msg"))?;
     Ok(serde_json::from_str(body.get())?)
+}
+
+/// Kalshi documents its timestamps as optional, and a missing one says nothing
+/// about the book, so the local time stands in rather than costing a resync.
+fn exchange_time(ms: Option<i64>) -> Result<i64, NormaliseError> {
+    checked_time(ms.unwrap_or_else(|| Utc::now().timestamp_millis()))
 }
 
 /// Rejects a time the output format cannot hold, so one bad frame costs a

@@ -34,8 +34,8 @@ enum MarketState {
     AwaitingSnapshot,
     Live {
         book: Book,
-        /// The exchange time of the state this book describes.
-        exchange_time_ms: i64,
+        /// The exchange position of the state this book describes.
+        stamp: Stamp,
         /// When the book last became crossed, if it still is.
         crossed_since: Option<Instant>,
     },
@@ -44,26 +44,69 @@ enum MarketState {
     Retired,
 }
 
-/// What the collector asks the rest of the program to do.
+/// Where a change sits on the exchange.
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    time_ms: i64,
+    clock: Option<u64>,
+}
+
+/// One thing to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CollectorOutput {
-    /// Record the whole book of a market.
+pub enum BookRecord {
+    /// The whole book of a market.
     Snapshot {
         symbol: String,
         exchange_time_ms: i64,
+        exchange_clock: Option<u64>,
         bids: Vec<Level>,
         asks: Vec<Level>,
     },
-    /// Record one absolute level change.
+    /// One absolute level change.
     Update {
         symbol: String,
         exchange_time_ms: i64,
+        exchange_clock: Option<u64>,
         change: LevelChange,
     },
+}
+
+/// What the collector asks the rest of the program to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectorOutput {
+    Record(BookRecord),
     /// Request replacement snapshots for these markets.
     Resync(Vec<String>),
-    /// This stream's connection ended, so it no longer feeds these markets.
-    Released(Vec<String>),
+}
+
+impl BookRecord {
+    /// Returns the market this record describes.
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Snapshot { symbol, .. } | Self::Update { symbol, .. } => symbol,
+        }
+    }
+
+    /// Returns the exchange clock of this record, if the provider has one.
+    pub fn exchange_clock(&self) -> Option<u64> {
+        match self {
+            Self::Snapshot { exchange_clock, .. } | Self::Update { exchange_clock, .. } => {
+                *exchange_clock
+            }
+        }
+    }
+
+    /// Returns the exchange time of this record.
+    pub fn exchange_time_ms(&self) -> i64 {
+        match self {
+            Self::Snapshot {
+                exchange_time_ms, ..
+            }
+            | Self::Update {
+                exchange_time_ms, ..
+            } => *exchange_time_ms,
+        }
+    }
 }
 
 impl Collector {
@@ -103,16 +146,30 @@ impl Collector {
             MarketEvent::Snapshot {
                 symbol,
                 exchange_time_ms,
+                exchange_clock,
                 bids,
                 asks,
-            } => self.on_snapshot(symbol, exchange_time_ms, bids, asks, now),
+            } => {
+                let stamp = Stamp {
+                    time_ms: exchange_time_ms,
+                    clock: exchange_clock,
+                };
+                self.on_snapshot(symbol, stamp, bids, asks, now)
+            }
             MarketEvent::Delta {
                 symbol,
                 exchange_time_ms,
+                exchange_clock,
                 side,
                 price,
                 delta,
-            } => self.on_delta(symbol, exchange_time_ms, side, price, delta, now),
+            } => {
+                let stamp = Stamp {
+                    time_ms: exchange_time_ms,
+                    clock: exchange_clock,
+                };
+                self.on_delta(symbol, stamp, side, price, delta, now)
+            }
             MarketEvent::ContinuityLost => self.invalidate_live(),
         }
     }
@@ -146,19 +203,17 @@ impl Collector {
         self.markets
             .keys()
             .filter_map(|symbol| self.snapshot(symbol))
+            .map(CollectorOutput::Record)
             .collect()
     }
 
     /// Returns a snapshot of one book, if it is live.
-    pub fn snapshot(&self, symbol: &str) -> Option<CollectorOutput> {
+    pub fn snapshot(&self, symbol: &str) -> Option<BookRecord> {
         match self.markets.get(symbol)? {
-            MarketState::Live {
-                book,
-                exchange_time_ms,
-                ..
-            } => Some(CollectorOutput::Snapshot {
+            MarketState::Live { book, stamp, .. } => Some(BookRecord::Snapshot {
                 symbol: symbol.to_owned(),
-                exchange_time_ms: *exchange_time_ms,
+                exchange_time_ms: stamp.time_ms,
+                exchange_clock: stamp.clock,
                 bids: book.bids().collect(),
                 asks: book.asks().collect(),
             }),
@@ -188,7 +243,7 @@ impl Collector {
     fn on_delta(
         &mut self,
         symbol: String,
-        exchange_time_ms: i64,
+        stamp: Stamp,
         side: Side,
         price: Price,
         delta: QuantityDelta,
@@ -201,7 +256,7 @@ impl Collector {
         };
         let MarketState::Live {
             book,
-            exchange_time_ms: latest,
+            stamp: latest,
             crossed_since,
         } = state
         else {
@@ -214,12 +269,13 @@ impl Collector {
             }
             Ok(change) => {
                 update_crossing(book, crossed_since, now);
-                *latest = exchange_time_ms;
-                vec![CollectorOutput::Update {
+                *latest = stamp;
+                vec![CollectorOutput::Record(BookRecord::Update {
                     symbol,
-                    exchange_time_ms,
+                    exchange_time_ms: stamp.time_ms,
+                    exchange_clock: stamp.clock,
                     change,
-                }]
+                })]
             }
             Err(error) => {
                 warn!(%symbol, %error, "Delta contradicts the book");
@@ -231,7 +287,7 @@ impl Collector {
     fn on_snapshot(
         &mut self,
         symbol: String,
-        exchange_time_ms: i64,
+        stamp: Stamp,
         bids: Vec<Level>,
         asks: Vec<Level>,
         now: Instant,
@@ -245,16 +301,17 @@ impl Collector {
         }
         match Book::from_levels(bids, asks) {
             Ok(book) => {
-                let output = CollectorOutput::Snapshot {
+                let output = CollectorOutput::Record(BookRecord::Snapshot {
                     symbol,
-                    exchange_time_ms,
+                    exchange_time_ms: stamp.time_ms,
+                    exchange_clock: stamp.clock,
                     bids: book.bids().collect(),
                     asks: book.asks().collect(),
-                };
+                });
                 let crossed_since = book.is_crossed().then_some(now);
                 *state = MarketState::Live {
                     book,
-                    exchange_time_ms,
+                    stamp,
                     crossed_since,
                 };
                 vec![output]

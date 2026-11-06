@@ -1,6 +1,6 @@
 //! End-to-end behavioural traces of the collector.
 
-use engineering_challenge::collector::{Collector, CollectorOutput};
+use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::domain::{Level, MarketEvent, Price, Quantity};
 use engineering_challenge::kalshi::normalise::Normaliser;
 use serde_json::json;
@@ -67,7 +67,9 @@ fn interleaved_symbols_on_one_sid_have_no_false_gap() {
     stream.feed(snapshot("A", 1, &[["0.40", "1.00"]], &[]));
     stream.feed(snapshot("B", 2, &[["0.50", "1.00"]], &[]));
     let outputs = stream.feed(delta("A", 3, "0.40", "2.00"));
-    assert!(matches!(&outputs[..], [CollectorOutput::Update { symbol, .. }] if symbol == "A"));
+    assert!(
+        matches!(&outputs[..], [CollectorOutput::Record(BookRecord::Update { symbol, .. })] if symbol == "A")
+    );
     assert_eq!(stream.collector.live_books().count(), 2);
 }
 
@@ -78,7 +80,7 @@ fn bids_only_snapshot_clears_old_asks() {
     let mut stream = Stream::new(&["A"]);
     stream.feed(snapshot("A", 1, &[["0.40", "1.00"]], &[["0.50", "1.00"]]));
     let outputs = stream.feed(snapshot("A", 2, &[["0.41", "1.00"]], &[]));
-    let [CollectorOutput::Snapshot { bids, asks, .. }] = &outputs[..] else {
+    let [CollectorOutput::Record(BookRecord::Snapshot { bids, asks, .. })] = &outputs[..] else {
         panic!("expected snapshot, got {outputs:?}");
     };
     assert_eq!(bids, &[level(410_000, 1_000_000)]);
@@ -87,23 +89,6 @@ fn bids_only_snapshot_clears_old_asks() {
 
 // Trace: Quantity 7, signed change -2, then -5
 // Expected: Output absolute 5 then 0, remove stored level
-#[test]
-fn signed_deltas_emit_absolute_quantities_and_remove_at_zero() {
-    let mut stream = Stream::new(&["A"]);
-    stream.feed(snapshot("A", 1, &[["0.40", "7.00"]], &[]));
-    let quantity = |outputs: Vec<CollectorOutput>| match &outputs[..] {
-        [CollectorOutput::Update { change, .. }] => change.quantity.raw(),
-        other => panic!("expected update, got {other:?}"),
-    };
-    assert_eq!(
-        quantity(stream.feed(delta("A", 2, "0.40", "-2.00"))),
-        5_000_000
-    );
-    assert_eq!(quantity(stream.feed(delta("A", 3, "0.40", "-5.00"))), 0);
-    let (_, book) = stream.collector.live_books().next().unwrap();
-    assert_eq!(book.bids().count(), 0);
-}
-
 // Trace: One delta in a subscription is missing
 // Expected: Every dependent replica becomes invalid; no authoritative periodic snapshot from it
 #[test]

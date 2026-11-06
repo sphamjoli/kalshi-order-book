@@ -1,39 +1,36 @@
 //! Socket manager: decides which socket holds each market and keeps the
 //! sockets running. Sockets do the I/O; this module only places markets.
 
-use crate::kalshi::stream::{KalshiStream, OutputHandler, StreamCommand};
+use crate::provider::{MarketStream, StreamCommand, StreamHandler};
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-/// The connections Kalshi allows a Basic account.
-const CONNECTION_LIMIT: usize = 200;
 /// How long sockets get to send a Close frame before they are aborted.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A handler that each socket task can own a copy of.
-pub trait StreamHandler: OutputHandler + Clone + Send + 'static {}
-
-impl<T: OutputHandler + Clone + Send + 'static> StreamHandler for T {}
-
 /// Runs every market on each of several independent feeds, so losing a socket
 /// never leaves a market without a live copy. Feeds share no sockets.
-pub struct SocketManager<H> {
-    feeds: Vec<Feed<H>>,
+pub struct SocketManager<S, H> {
+    feeds: Vec<Feed<S, H>>,
 }
 
 /// One complete set of sockets. Each market sits on exactly one of them.
-struct Feed<H> {
-    template: KalshiStream,
+struct Feed<S, H> {
+    template: S,
     capacity: usize,
     handler: H,
     sockets: Vec<SocketHandle>,
     placement: HashMap<String, usize>,
+    /// The most sockets this feed may open, its share of the provider's limit.
+    socket_limit: usize,
     tasks: JoinSet<()>,
+    /// Which socket each running task serves.
+    task_sockets: HashMap<Id, usize>,
 }
 
 /// One running socket.
@@ -42,10 +39,11 @@ struct SocketHandle {
     load: usize,
 }
 
-impl<H: StreamHandler> SocketManager<H> {
+impl<S: MarketStream, H: StreamHandler> SocketManager<S, H> {
     /// Creates a manager with one feed per handler and no sockets yet.
     /// `capacity` is the most markets one socket may hold.
-    pub fn new(template: KalshiStream, capacity: usize, handlers: Vec<H>) -> Self {
+    pub fn new(template: S, capacity: usize, handlers: Vec<H>) -> Self {
+        let socket_limit = (S::CONNECTION_LIMIT / handlers.len().max(1)).max(1);
         let feeds = handlers
             .into_iter()
             .map(|handler| Feed {
@@ -54,7 +52,9 @@ impl<H: StreamHandler> SocketManager<H> {
                 handler,
                 sockets: Vec::new(),
                 placement: HashMap::new(),
+                socket_limit,
                 tasks: JoinSet::new(),
+                task_sockets: HashMap::new(),
             })
             .collect();
         Self { feeds }
@@ -83,12 +83,13 @@ impl<H: StreamHandler> SocketManager<H> {
         for feed in &mut self.feeds {
             feed.add(symbols.clone());
         }
-        if self.socket_count() > CONNECTION_LIMIT {
-            warn!(
-                sockets = self.socket_count(),
-                limit = CONNECTION_LIMIT,
-                "More sockets than a Basic account allows"
-            );
+    }
+
+    /// Restarts every socket whose task has ended, with the markets it held.
+    /// Nothing ends a socket task except a panic or [`Self::close`].
+    pub fn restart_failed(&mut self) {
+        for feed in &mut self.feeds {
+            feed.restart_failed();
         }
     }
 
@@ -109,7 +110,7 @@ impl<H: StreamHandler> SocketManager<H> {
     }
 }
 
-impl<H: StreamHandler> Feed<H> {
+impl<S: MarketStream, H: StreamHandler> Feed<S, H> {
     /// Places every market not yet placed on the least-loaded socket with
     /// room.
     fn add(&mut self, mut symbols: Vec<String>) {
@@ -125,13 +126,13 @@ impl<H: StreamHandler> Feed<H> {
                 Some(index) => {
                     let room = self.capacity - self.sockets[index].load;
                     let batch = take_batch(&mut symbols, room);
-                    self.record(index, &batch);
-                    self.send(index, StreamCommand::Add(batch));
+                    self.place(index, batch);
                 }
-                None => {
+                None if self.sockets.len() < self.socket_limit => {
                     let batch = take_batch(&mut symbols, self.capacity);
                     self.spawn_socket(batch);
                 }
+                None => self.overfill(&mut symbols),
             }
         }
     }
@@ -148,6 +149,50 @@ impl<H: StreamHandler> Feed<H> {
             info!(markets = batch.len(), socket = index, "Removing markets");
             self.sockets[index].load -= batch.len();
             self.send(index, StreamCommand::Remove(batch));
+        }
+    }
+
+    /// Every socket is full and no more are allowed. Coverage comes first, so
+    /// the sockets go over their capacity rather than leave markets out.
+    fn overfill(&mut self, symbols: &mut Vec<String>) {
+        warn!(
+            markets = symbols.len(),
+            sockets = self.sockets.len(),
+            "Socket limit reached; filling sockets past their capacity"
+        );
+        let share = symbols.len().div_ceil(self.sockets.len());
+        for index in 0..self.sockets.len() {
+            let batch = take_batch(symbols, share);
+            if !batch.is_empty() {
+                self.place(index, batch);
+            }
+        }
+    }
+
+    fn place(&mut self, index: usize, batch: Vec<String>) {
+        self.record(index, &batch);
+        self.send(index, StreamCommand::Add(batch));
+    }
+
+    fn restart_failed(&mut self) {
+        while let Some(ended) = self.tasks.try_join_next_with_id() {
+            let id = ended.as_ref().map_or_else(JoinError::id, |(id, ())| *id);
+            let Some(index) = self.task_sockets.remove(&id) else {
+                continue;
+            };
+            let symbols: Vec<String> = self
+                .placement
+                .iter()
+                .filter(|(_, socket)| **socket == index)
+                .map(|(symbol, _)| symbol.clone())
+                .collect();
+            warn!(
+                socket = index,
+                markets = symbols.len(),
+                "Restarting a failed socket"
+            );
+            self.handler.on_released(&symbols);
+            self.start_socket(index, symbols);
         }
     }
 
@@ -179,14 +224,22 @@ impl<H: StreamHandler> Feed<H> {
     }
 
     fn spawn_socket(&mut self, batch: Vec<String>) {
-        let (commands, receiver) = unbounded_channel();
         let index = self.sockets.len();
+        let (commands, _) = unbounded_channel();
         self.sockets.push(SocketHandle { commands, load: 0 });
         self.record(index, &batch);
-        let stream = self.template.for_tickers(batch);
+        self.start_socket(index, batch);
+    }
+
+    fn start_socket(&mut self, index: usize, symbols: Vec<String>) {
+        let (commands, receiver) = unbounded_channel();
+        self.sockets[index].commands = commands;
+        let stream = self.template.for_markets(symbols);
         let handler = self.handler.clone();
-        self.tasks
+        let task = self
+            .tasks
             .spawn(async move { stream.run(receiver, handler).await });
+        self.task_sockets.insert(task.id(), index);
     }
 }
 

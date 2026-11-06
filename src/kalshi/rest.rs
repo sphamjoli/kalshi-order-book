@@ -84,6 +84,10 @@ pub struct RetryPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketQuery {
     Open,
+    /// Markets that have not opened yet.
+    Unopened,
+    /// Markets not yet open that were created at or after this time.
+    UnopenedSince(i64),
     /// Open markets created at or after this time.
     CreatedSince(i64),
     /// Closed markets that closed at or after this time.
@@ -98,6 +102,8 @@ pub enum MarketQuery {
 pub struct Market {
     pub ticker: String,
     pub status: String,
+    /// When trading starts, in RFC 3339.
+    pub open_time: Option<String>,
 }
 
 /// One page of `GET /markets`.
@@ -234,6 +240,8 @@ impl KalshiClient {
         let mut url = self.base_url.join(MARKETS_PATH)?;
         let (status, time_filter) = match query {
             MarketQuery::Open => ("open", None),
+            MarketQuery::Unopened => ("unopened", None),
+            MarketQuery::UnopenedSince(time) => ("unopened", Some(("min_created_ts", time))),
             MarketQuery::CreatedSince(time) => ("open", Some(("min_created_ts", time))),
             MarketQuery::ClosedSince(time) => ("closed", Some(("min_close_ts", time))),
             MarketQuery::SettledSince(time) => ("settled", Some(("min_settled_ts", time))),
@@ -259,12 +267,8 @@ impl KalshiClient {
             match self.get_once(url.clone()).await {
                 Err(error) if error.is_retryable() && attempt + 1 < self.retry.attempts => {
                     warn!(%error, attempt, "Request failed; retrying");
-                    tokio::time::sleep(transport::backoff(
-                        attempt,
-                        self.retry.base,
-                        self.retry.max,
-                    ))
-                    .await;
+                    let delay = transport::backoff(attempt, self.retry.base, self.retry.max);
+                    tokio::time::sleep(transport::spread(delay, self.retry.base)).await;
                     attempt += 1;
                 }
                 result => return result,
