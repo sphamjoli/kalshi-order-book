@@ -51,6 +51,12 @@ fn negative_result_is_rejected_and_leaves_the_book_unchanged() {
         .unwrap_err();
     assert_eq!(error, BookError::NegativeQuantity(-2));
     assert_eq!(changed, book());
+
+    let error = changed
+        .apply(Side::Buy, price(38), QuantityDelta::new(-1))
+        .unwrap_err();
+    assert_eq!(error, BookError::NegativeQuantity(-1), "a missing level");
+    assert_eq!(changed, book());
 }
 
 #[test]
@@ -92,22 +98,6 @@ fn snapshot_treats_zero_levels_as_absent() {
 }
 
 #[test]
-fn duplicate_snapshot_level_is_rejected() {
-    let error = Book::from_levels([level(40, 1), level(40, 2)], []).unwrap_err();
-    assert_eq!(error, BookError::DuplicateLevel(40));
-}
-
-#[test]
-fn negative_change_at_a_missing_level_is_rejected() {
-    let mut changed = book();
-    let error = changed
-        .apply(Side::Buy, price(38), QuantityDelta::new(-1))
-        .unwrap_err();
-    assert_eq!(error, BookError::NegativeQuantity(-1));
-    assert_eq!(changed, book());
-}
-
-#[test]
 fn crossing_is_detected_at_and_beyond_equal_prices() {
     let crossed = |bid, ask| {
         Book::from_levels([level(bid, 1)], [level(ask, 1)])
@@ -117,13 +107,10 @@ fn crossing_is_detected_at_and_beyond_equal_prices() {
     assert!(!crossed(44, 45));
     assert!(crossed(45, 45));
     assert!(crossed(46, 45));
-}
 
-#[test]
-fn crossing_uses_the_best_level_of_each_side() {
     let book =
         Book::from_levels([level(10, 1), level(46, 1)], [level(90, 1), level(45, 1)]).unwrap();
-    assert!(book.is_crossed());
+    assert!(book.is_crossed(), "the best level of each side decides");
 }
 
 #[test]
@@ -144,21 +131,21 @@ fn a_crossing_change_is_applied_and_can_clear() {
 }
 
 #[test]
-fn duplicate_is_rejected_even_when_one_level_is_zero() {
-    for levels in [[level(40, 0), level(40, 2)], [level(40, 2), level(40, 0)]] {
+fn a_duplicate_level_is_rejected_even_at_zero() {
+    for levels in [
+        [level(40, 1), level(40, 2)],
+        [level(40, 0), level(40, 2)],
+        [level(40, 2), level(40, 0)],
+    ] {
         let error = Book::from_levels(levels, []).unwrap_err();
         assert_eq!(error, BookError::DuplicateLevel(40));
     }
 }
 
 #[test]
-fn zero_units_are_valid() {
+fn units_start_at_zero() {
     assert_eq!(Price::try_new(0).unwrap().raw(), 0);
     assert_eq!(Quantity::try_new(0), Ok(Quantity::ZERO));
-}
-
-#[test]
-fn negative_units_are_rejected() {
     assert_eq!(Price::try_new(-1), Err(BookError::NegativePrice(-1)));
     assert_eq!(Quantity::try_new(-1), Err(BookError::NegativeQuantity(-1)));
 }

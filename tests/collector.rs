@@ -1,7 +1,7 @@
 //! Book lifecycle rules, driven with normalised events.
 
 use engineering_challenge::Side;
-use engineering_challenge::collector::{Collector, CollectorOutput};
+use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::domain::{Level, MarketEvent, Price, Quantity, QuantityDelta};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ fn snapshot(symbol: &str, bids: Vec<Level>, asks: Vec<Level>) -> MarketEvent {
     MarketEvent::Snapshot {
         symbol: symbol.to_owned(),
         exchange_time_ms: 1,
+        exchange_clock: None,
         bids,
         asks,
     }
@@ -31,6 +32,7 @@ fn delta(symbol: &str, side: Side, price: i64, change: i64) -> MarketEvent {
     MarketEvent::Delta {
         symbol: symbol.to_owned(),
         exchange_time_ms: 1,
+        exchange_clock: None,
         side,
         price: Price::try_new(price).unwrap(),
         delta: QuantityDelta::new(change),
@@ -177,7 +179,8 @@ fn snapshots_cover_quiet_live_books_and_skip_the_rest() {
     let _ = collector.handle(snapshot("A", vec![level(40)], vec![]), now);
     let _ = collector.handle(delta("A", Side::Buy, 40, 1), now);
     let snapshots = collector.snapshots();
-    let [CollectorOutput::Snapshot { symbol, bids, .. }] = &snapshots[..] else {
+    let [CollectorOutput::Record(BookRecord::Snapshot { symbol, bids, .. })] = &snapshots[..]
+    else {
         panic!("expected only A, got {snapshots:?}");
     };
     assert_eq!(symbol, "A");
@@ -191,8 +194,35 @@ fn a_book_past_the_output_limit_is_resynced() {
     let _ = collector.handle(snapshot("A", vec![], vec![]), now);
     for price in 1..=65_535 {
         let outputs = collector.handle(delta("A", Side::Buy, price, 5), now);
-        assert!(matches!(outputs[..], [CollectorOutput::Update { .. }]));
+        assert!(matches!(
+            outputs[..],
+            [CollectorOutput::Record(BookRecord::Update { .. })]
+        ));
     }
     let outputs = collector.handle(delta("A", Side::Buy, 65_536, 5), now);
     assert_eq!(outputs, [CollectorOutput::Resync(vec!["A".to_owned()])]);
+}
+
+#[test]
+fn a_snapshot_carries_the_clock_of_the_latest_delta() {
+    let mut collector = Collector::new(["A".to_owned()], Duration::from_secs(5));
+    let snapshot = MarketEvent::Snapshot {
+        symbol: "A".to_owned(),
+        exchange_time_ms: 1,
+        exchange_clock: Some(5),
+        bids: vec![],
+        asks: vec![],
+    };
+    let delta = MarketEvent::Delta {
+        symbol: "A".to_owned(),
+        exchange_time_ms: 2,
+        exchange_clock: Some(9),
+        side: Side::Buy,
+        price: Price::try_new(400_000).unwrap(),
+        delta: QuantityDelta::new(1_000_000),
+    };
+    let _ = collector.handle(snapshot, Instant::now());
+    assert_eq!(collector.snapshot("A").unwrap().exchange_clock(), Some(5));
+    let _ = collector.handle(delta, Instant::now());
+    assert_eq!(collector.snapshot("A").unwrap().exchange_clock(), Some(9));
 }

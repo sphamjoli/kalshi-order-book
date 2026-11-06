@@ -2,7 +2,7 @@
 
 use chrono::DateTime;
 use engineering_challenge::Side;
-use engineering_challenge::collector::CollectorOutput;
+use engineering_challenge::collector::BookRecord;
 use engineering_challenge::domain::{Level, LevelChange, Price, Quantity};
 use engineering_challenge::output::{
     OutputError, OutputRecord, SbeOutput, Summary, summarise, write_records,
@@ -22,7 +22,7 @@ fn level(price: i64, quantity: i64) -> Level {
     }
 }
 
-fn record(output: CollectorOutput) -> OutputRecord {
+fn record(output: BookRecord) -> OutputRecord {
     OutputRecord {
         output,
         received_at: DateTime::from_timestamp_micros(1_700_000_000_000_123).unwrap(),
@@ -30,18 +30,20 @@ fn record(output: CollectorOutput) -> OutputRecord {
 }
 
 fn snapshot() -> OutputRecord {
-    record(CollectorOutput::Snapshot {
+    record(BookRecord::Snapshot {
         symbol: "M".to_owned(),
         exchange_time_ms: 1_700_000_000_000,
+        exchange_clock: None,
         bids: vec![level(400_000, 2_000_000), level(300_000, 1_000_000)],
         asks: vec![level(600_000, 3_500_000)],
     })
 }
 
 fn update() -> OutputRecord {
-    record(CollectorOutput::Update {
+    record(BookRecord::Update {
         symbol: "M".to_owned(),
         exchange_time_ms: 1_700_000_000_001,
+        exchange_clock: None,
         change: LevelChange {
             side: Side::Sell,
             price: Price::try_new(600_000).unwrap(),
@@ -98,12 +100,6 @@ fn an_update_keeps_every_field_and_zero_means_removed() {
 }
 
 #[test]
-fn a_resync_writes_nothing() {
-    let file = encoded(&[record(CollectorOutput::Resync(vec!["M".to_owned()]))]);
-    assert_eq!(file.as_file().metadata().unwrap().len(), 0);
-}
-
-#[test]
 fn the_supplied_reader_walks_every_record() {
     let file = encoded(&[snapshot(), update(), update()]);
     let expected = Summary {
@@ -116,9 +112,10 @@ fn the_supplied_reader_walks_every_record() {
 
 #[test]
 fn an_out_of_range_time_is_rejected() {
-    let bad = record(CollectorOutput::Snapshot {
+    let bad = record(BookRecord::Snapshot {
         symbol: "M".to_owned(),
         exchange_time_ms: i64::MAX,
+        exchange_clock: None,
         bids: vec![],
         asks: vec![],
     });
