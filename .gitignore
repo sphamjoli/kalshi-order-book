@@ -1,1 +1,12 @@
 /target/
+
+.env*
+!.env.example
+*.pem
+*.key
+Testing.txt
+*.p8
+*.der
+*.sbe
+*.log
+results/
