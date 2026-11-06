@@ -4,6 +4,7 @@ use engineering_challenge::Side;
 use engineering_challenge::collector::{BookRecord, Collector, CollectorOutput};
 use engineering_challenge::domain::{Level, MarketEvent, Price, Quantity, QuantityDelta};
 use engineering_challenge::failover::{Failover, FeedId};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 const PRIMARY: FeedId = FeedId(0);
@@ -289,8 +290,112 @@ fn a_switch_with_clocks_records_a_snapshot_then_deltas() {
 
 #[test]
 fn a_late_copy_of_a_change_inside_a_snapshot_is_dropped() {
-    let (mut failover, _primary, mut backup) = clocked();
+    let (mut failover, mut primary, mut backup) = clocked();
+    feed(&mut failover, PRIMARY, &mut primary, clocked_snapshot(11));
+    assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(11)).is_empty());
+}
+
+#[test]
+fn a_change_after_a_snapshot_at_its_clock_is_recorded_once() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    assert!(is_update(&feed(
+        &mut failover,
+        PRIMARY,
+        &mut primary,
+        clocked_delta(10)
+    )));
     assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(10)).is_empty());
+}
+
+#[test]
+fn a_minute_snapshot_between_changes_sharing_a_clock_loses_neither() {
+    let (mut failover, mut primary, mut backup) = clocked();
+    feed(&mut failover, PRIMARY, &mut primary, clocked_delta(11));
+    let snapshot = primary.snapshot("M").unwrap();
+    assert!(failover.route(PRIMARY, &primary, &snapshot).is_some());
+    assert!(is_update(&feed(
+        &mut failover,
+        PRIMARY,
+        &mut primary,
+        clocked_delta(11)
+    )));
+    for _ in 0..2 {
+        assert!(feed(&mut failover, BACKUP, &mut backup, clocked_delta(11)).is_empty());
+    }
+}
+
+/// A consumer's book, rebuilt from the record alone.
+#[derive(Default)]
+struct Replayed {
+    bids: BTreeMap<i64, i64>,
+    asks: BTreeMap<i64, i64>,
+}
+
+impl Replayed {
+    fn apply(&mut self, records: &[BookRecord]) {
+        for record in records {
+            match record {
+                BookRecord::Snapshot { bids, asks, .. } => {
+                    self.bids = levels(bids);
+                    self.asks = levels(asks);
+                }
+                BookRecord::Update { change, .. } => {
+                    let side = match change.side {
+                        Side::Buy => &mut self.bids,
+                        Side::Sell => &mut self.asks,
+                    };
+                    side.insert(change.price.raw(), change.quantity.raw());
+                    side.retain(|_, quantity| *quantity != 0);
+                }
+            }
+        }
+    }
+
+    fn matches(&self, collector: &Collector) -> bool {
+        let Some(BookRecord::Snapshot { bids, asks, .. }) = collector.snapshot("M") else {
+            return false;
+        };
+        self.bids == levels(&bids) && self.asks == levels(&asks)
+    }
+}
+
+fn levels(levels: &[Level]) -> BTreeMap<i64, i64> {
+    levels
+        .iter()
+        .map(|level| (level.price.raw(), level.quantity.raw()))
+        .collect()
+}
+
+#[test]
+fn replaying_the_record_rebuilds_the_book_across_a_failover() {
+    let (mut failover, mut primary, mut backup) = (Failover::default(), collector(), collector());
+    let mut replayed = Replayed::default();
+    for (id, book) in [(PRIMARY, &mut primary), (BACKUP, &mut backup)] {
+        replayed.apply(&feed(&mut failover, id, book, clocked_snapshot(10)));
+    }
+    let both = |failover: &mut Failover, primary: &mut Collector, backup: &mut Collector, clock| {
+        let recorded = feed(failover, PRIMARY, primary, clocked_delta(clock));
+        assert!(feed(failover, BACKUP, backup, clocked_delta(clock)).is_empty());
+        recorded
+    };
+    replayed.apply(&both(&mut failover, &mut primary, &mut backup, 10));
+    replayed.apply(&both(&mut failover, &mut primary, &mut backup, 11));
+    let snapshot = primary.snapshot("M").unwrap();
+    replayed.apply(&Vec::from_iter(
+        failover.route(PRIMARY, &primary, &snapshot),
+    ));
+    replayed.apply(&both(&mut failover, &mut primary, &mut backup, 11));
+    assert!(replayed.matches(&primary));
+    failover.release(PRIMARY, &released());
+    for clock in [12, 12, 13] {
+        replayed.apply(&feed(
+            &mut failover,
+            BACKUP,
+            &mut backup,
+            clocked_delta(clock),
+        ));
+    }
+    assert!(replayed.matches(&backup));
 }
 
 #[test]

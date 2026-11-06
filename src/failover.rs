@@ -24,9 +24,12 @@ pub struct FeedId(pub usize);
 
 /// A place in one market's changes. Several changes can share a clock, and
 /// every feed delivers those in the same order, so the ordinal tells them apart.
+/// A snapshot that opens a clock may contain any of that clock's changes, so
+/// `after_snapshot` places the changes that follow it after those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Position {
     clock: u64,
+    after_snapshot: bool,
     ordinal: u32,
 }
 
@@ -172,7 +175,8 @@ impl MarketMerge {
 
     /// Moves `feed` to `clock`, and returns its new position and whether its
     /// own clock went backwards, as exchange maintenance can cause. A snapshot
-    /// covers every change at its clock, so it sits after all of them.
+    /// at the feed's current clock holds exactly the changes the feed has
+    /// applied, so it leaves the position where it is.
     fn advance(
         &mut self,
         feed: FeedId,
@@ -183,13 +187,19 @@ impl MarketMerge {
         let Some(clock) = clock else {
             return (None, false);
         };
-        let ordinal = match *last {
-            _ if is_snapshot => u32::MAX,
-            Some(last) if last.clock == clock => last.ordinal.saturating_add(1),
-            _ => 0,
+        let position = match *last {
+            Some(last) if last.clock == clock && is_snapshot => last,
+            Some(last) if last.clock == clock => Position {
+                ordinal: last.ordinal.saturating_add(1),
+                ..last
+            },
+            _ => Position {
+                clock,
+                after_snapshot: is_snapshot,
+                ordinal: 0,
+            },
         };
         let fell = last.is_some_and(|last| clock < last.clock);
-        let position = Position { clock, ordinal };
         *last = Some(position);
         (Some(position), fell)
     }
