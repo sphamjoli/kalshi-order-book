@@ -6,7 +6,7 @@ This repository contains a Rust service that records the order books of live, no
 
 ![Data flow from a market provider through the provider contracts, tracker, socket manager, collectors, failover and queue to the SBE writer](docs/diagrams/architecture.svg)
 
-`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes many minutes. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. It also tracks listed markets that have not opened, and follows each at its opening time. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full. A feed never opens more than its share of the provider's connection limit. Beyond that limit, sockets exceed their target size, because coverage takes priority over an even spread. A socket task that panics is restarted with its markets at the next poll, or at the next page of the first scan.
+`MarketTracker` pages through Kalshi's market list and passes each page on as it arrives, because a full scan takes several minutes. Pages are requested gzip-compressed, which shrinks a page of 1,000 markets from about 2.1 MB to about 130 KB. Once the scan ends, it polls every 30 seconds for markets that opened, closed or settled, and repeats the full scan hourly. It also tracks listed markets that have not opened, and follows each at its opening time. `SocketManager` places each market on the least-loaded socket and opens another socket when every existing one is full. A feed never opens more than its share of the provider's connection limit. Beyond that limit, sockets exceed their target size, because coverage takes priority over an even spread. A socket task that panics is restarted with its markets at the next poll, or at the next page of the first scan.
 
 Each `KalshiStream` owns one signed WebSocket connection. It reconnects after a failure, with a delay that grows while connections keep failing, and replaces a healthy connection every six hours. Incoming frames pass to `Normaliser`, which checks sequence numbers and converts Kalshi's format into exchange-neutral events. Kalshi quotes YES and NO bids, so a NO bid at price *p* is recorded as a sell at 1 − *p*.
 
@@ -184,35 +184,44 @@ The evaluation asks whether the service records Kalshi books in a decodable form
 
 ### Method
 
-All runs used one Mac on a home connection against production Kalshi. The experiments ran as two sets. Set A ran on the afternoon of 6 November 2026, and set B ran overnight from 6 to 7 November on the current code, after a change to how the merge orders changes that share a clock. The long run ran once, on 5 November. Other software shared the machine, and its five-minute load average stayed between about 4 and 10 during set A and between about 5 and 24 during set B. Each run started with no state and stopped on SIGINT. A baseline run scanned markets with no sockets open. Size runs varied markets per socket. A backlog run sampled throughput, unread socket bytes and CPU every 10 to 15 seconds. A link run measured the connection with `networkQuality` while idle and again during collection. A connection loss is any connection that ended and was replaced. A market is placed once it is handed to a socket. All runs with sockets open used a single feed. Every experiment except the long run can be repeated with `make experiments`, and `make summary` prints these tables from the logs. [CONTRIBUTIONS.md](CONTRIBUTIONS.md) describes the targets.
+All runs used one Mac on a home connection against production Kalshi. The experiments ran as three sets. Sets A and B fetched market pages uncompressed, and set C requested them gzip-compressed. Set A ran on the afternoon of 6 November 2026. Set B ran overnight from 6 to 7 November, after a change to how the merge orders changes that share a clock. Set C ran on the evening of 7 November on the current code. The long run ran once, on 5 November, without compression. Other software shared the machine, and its five-minute load average stayed between about 4 and 10 during set A, about 5 and 24 during set B, and about 3 and 15 during set C. Each run started with no state and stopped on SIGINT. A baseline run scanned markets with no sockets open. Size runs varied markets per socket. A backlog run sampled throughput, unread socket bytes and CPU every 10 to 15 seconds. A link run measured the connection with `networkQuality` while idle and again during collection. A connection loss is any connection that ended and was replaced. A market is placed once it is handed to a socket. In set C every run finished a full scan, so its first table reports the minutes the first scan took instead of markets placed. All runs with sockets open used a single feed. Every experiment except the long run can be repeated with `make experiments`, and `make summary` prints these tables from the logs. [CONTRIBUTIONS.md](CONTRIBUTIONS.md) describes the targets.
 
 ### Results
 
 **Table 1.** Markets placed and connection losses by run.
 
-| Run | Duration (min) | Markets per socket | Set A placed | Set A losses | Set B placed | Set B losses |
-|---|---|---|---|---|---|---|
-| Long | 50 | 2,000 | 51,000 | 65 | not run | not run |
-| Size | 15 | 2,000 | 100,000 | 23 | 58,000 | 11 |
-| Size | 15 | 500 | 72,000 | 12 | 59,000 | 8 |
-| Backlog | 22 | 1,000 | 141,000 | 29 | 80,000 | 21 |
-| Link | 15 | 1,000 | 84,000 | 33 | 73,000 | 29 |
+| Run | Duration (min) | Markets per socket | Set A placed | Set A losses | Set B placed | Set B losses | Set C full scan (min) | Set C losses |
+|---|---|---|---|---|---|---|---|---|
+| Long | 50 | 2,000 | 51,000 | 65 | not run | not run | not run | not run |
+| Baseline | 5 | no sockets | 0 | 0 | 0 | 0 | 2.6 | 0 |
+| Size | 15 | 2,000 | 100,000 | 23 | 58,000 | 11 | 5.4 | 107 |
+| Size | 15 | 500 | 72,000 | 12 | 59,000 | 8 | 12.6 | 512 |
+| Backlog | 22 | 1,000 | 141,000 | 29 | 80,000 | 21 | 6.8 | 185 |
+| Link | 15 | 1,000 | 84,000 | 33 | 73,000 | 29 | 7.5 | 276 |
 
-**Table 2.** Connection losses by cause. Server closed includes connections that ended without a TLS close.
+Each set C full scan covered about 187,000 markets.
 
-| Run | Reset | Server closed | Snapshots unanswered | Silence |
-|---|---|---|---|---|
-| Long | 62 | 2 | 1 | 0 |
-| Set A, size 2,000 | 12 | 8 | 3 | 0 |
-| Set A, size 500 | 12 | 0 | 0 | 0 |
-| Set A, backlog | 11 | 16 | 2 | 0 |
-| Set A, link | 15 | 3 | 0 | 15 |
-| Set B, size 2,000 | 9 | 2 | 0 | 0 |
-| Set B, size 500 | 7 | 1 | 0 | 0 |
-| Set B, backlog | 19 | 2 | 0 | 0 |
-| Set B, link | 20 | 2 | 1 | 6 |
+**Table 2.** Connection losses by cause. Server closed includes connections that ended without a TLS close. A timeout is a send or handshake that passed its time limit.
 
-**Table 3.** Mean page time in seconds by position in the scan.
+| Run | Reset | Server closed | Snapshots unanswered | Silence | Timeout |
+|---|---|---|---|---|---|
+| Long | 62 | 2 | 1 | 0 | 0 |
+| Set A, size 2,000 | 12 | 8 | 3 | 0 | 0 |
+| Set A, size 500 | 12 | 0 | 0 | 0 | 0 |
+| Set A, backlog | 11 | 16 | 2 | 0 | 0 |
+| Set A, link | 15 | 3 | 0 | 15 | 0 |
+| Set B, size 2,000 | 9 | 2 | 0 | 0 | 0 |
+| Set B, size 500 | 7 | 1 | 0 | 0 | 0 |
+| Set B, backlog | 19 | 2 | 0 | 0 | 0 |
+| Set B, link | 20 | 2 | 1 | 6 | 0 |
+| Set C, size 2,000 | 106 | 0 | 0 | 1 | 0 |
+| Set C, size 500 | 292 | 35 | 0 | 75 | 109 |
+| Set C, backlog | 180 | 4 | 1 | 0 | 0 |
+| Set C, link | 96 | 8 | 0 | 106 | 66 |
+
+One set C loss at 500 markets per socket, a connection with no announced subscription, fits none of these causes.
+
+**Table 3.** Mean page time in seconds by position in the scan. In set C, pages 43 onwards include later scans.
 
 | Set | Pages | No sockets | 2,000 per socket | 500 per socket |
 |---|---|---|---|---|
@@ -222,22 +231,27 @@ All runs used one Mac on a home connection against production Kalshi. The experi
 | B | 1 to 20 | 9.2 | 13.9 | 7.9 |
 | B | 21 to 42 | 7.7 | 14.7 | 14.1 |
 | B | 43 onwards | no data | 18.2 | 24.6 |
+| C | 1 to 20 | 1.2 | 0.9 | 0.6 |
+| C | 21 to 42 | 0.8 | 1.4 | 0.9 |
+| C | 43 onwards | 0.8 | 1.4 | 5.1 |
 
 **Table 4.** Link measurements with `networkQuality`.
 
-| Measure | Set A idle | Set A collecting | Set B idle | Set B collecting |
-|---|---|---|---|---|
-| Download (Mbit/s) | 33.0 | 26.7 | 28.0 | 27.7 |
-| Download responsiveness (ms) | 264 | 644 | 297 | 484 |
-| Upload responsiveness (ms) | 1,043 | 2,466 | 1,366 | 1,650 |
-| Idle latency (ms) | 29 | 71 | 27 | 39 |
+| Measure | Set A idle | Set A collecting | Set B idle | Set B collecting | Set C idle | Set C collecting |
+|---|---|---|---|---|---|---|
+| Download (Mbit/s) | 33.0 | 26.7 | 28.0 | 27.7 | 26.9 | 28.0 |
+| Download responsiveness (ms) | 264 | 644 | 297 | 484 | 261 | 646 |
+| Upload responsiveness (ms) | 1,043 | 2,466 | 1,366 | 1,650 | 1,888 | 644 |
+| Idle latency (ms) | 29 | 71 | 27 | 39 | 18 | 51 |
 
-The long run recorded 960 MiB, including 1,593,029 snapshots, all decoded by the supplied reader, with memory at or below 140 MB. In the backlog runs, CPU averaged 14.7% of one core in set A and 11.9% in set B, with peaks of 30.5% and 19.7%. Traffic reached 40 and 21 Mbit/s, and unread socket bytes were zero in 82 and 87 of 89 samples. In each link run, all silence losses fell within 40 seconds, around the end of the speed test. One REST request was retried across the timed runs, in the set A link run. Every run exited cleanly.
+The long run recorded 960 MiB, including 1,593,029 snapshots, all decoded by the supplied reader, with memory at or below 140 MB. In the backlog runs, CPU averaged 14.7%, 11.9% and 23.6% of one core in sets A, B and C, with peaks of 30.5%, 19.7% and 36.4%. Unread socket bytes were zero in 82, 87 and 79 of 89 samples. Traffic reached 40 Mbit/s in set A and 21 Mbit/s in set B. The set C byte counter exceeded the measured link capacity, so its traffic figure is not reported. In the set A and B link runs, all silence losses fell within 40 seconds, around the end of the speed test. In the set C link run, they were spread over the six minutes before it. One REST request was retried across the timed runs, in the set A link run. Every run exited cleanly.
 
 ### Discussion
 
-The service recorded data that the supplied reader decoded at tens of thousands of markets. However, no run with sockets open completed a scan of the roughly 180,000 markets, and the furthest reached 141,000, so full coverage remains undemonstrated. The same backlog configuration placed 141,000 markets in set A and 80,000 in set B, so a single run does not give a typical scan rate. Set B also had the higher machine load and slower pages, including in the run with no sockets, but neither load nor time of day was isolated. Fewer losses in set B are expected in part because fewer markets were placed. Page times were highest beyond page 42 in all four size runs. The run at 500 markets per socket had fewer losses than the run at 2,000 in both sets, but two runs per size cannot separate socket size from other variation. The mostly empty backlog suggests that socket reads keep up. The silence losses at the end of both speed tests show that a saturated link can stall sockets. Congestion remains the leading explanation for the other losses, but it was not isolated.
+Compressed pages changed coverage more than any other factor. Without compression, no run with sockets open completed a scan, and the furthest reached 141,000 markets. With compression, every run completed a scan of about 187,000 markets, in 5.4 to 12.6 minutes with sockets open and 2.6 minutes without. Page times fell by a factor of about 5 to 15. The service recorded data that the supplied reader decoded, and in set C it held every market on the list at once.
 
-These results come from a single machine and network, and most configurations ran once. The two runs at 2,000 markets per socket differed in scan speed by a factor of more than six, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. A repeat from a well-connected machine is the next step.
+Following every market raised connection losses from 8 to 33 per run without compression to 107 to 512 with it. Set C carried more than twice as many markets as sets A and B, so more traffic and more sockets were exposed to each fault. Silence and timeout losses, which were rare before, made up most losses in the set C link run and over a third at 500 markets per socket. Those runs also had the slowest later pages. This pattern is consistent with a saturated link, and the silence losses at the end of the set A and B speed tests show that a saturated link can stall sockets. The run at 500 markets per socket had fewer losses than the run at 2,000 in sets A and B but nearly five times as many in set C, so socket size cannot be credited with either result. The same backlog configuration placed 141,000 markets in set A and 80,000 in set B, so a single run does not give a typical scan rate. The mostly empty backlog suggests that socket reads keep up, even at full coverage.
+
+These results come from a single machine and network, and most configurations ran once per set. The two uncompressed runs at 2,000 markets per socket differed in scan speed by a factor of more than six, so small differences between runs should not be interpreted. Market count, page depth and elapsed time rose together and were not separated. A repeat from a well-connected machine is the next step.
 
 The automated tests in `tests/` cover book rules, recovery, failover, routing, the provider contracts, normalising, discovery and output. One test rebuilds a book from the record alone across a failover and compares it with the live feed's book.

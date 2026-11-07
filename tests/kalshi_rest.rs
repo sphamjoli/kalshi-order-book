@@ -6,12 +6,15 @@ use engineering_challenge::kalshi::auth::{
 use engineering_challenge::kalshi::rest::{
     KalshiClient, Market, MarketQuery, RestError, RetryPolicy,
 };
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde_json::json;
+use std::io::Write;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockBuilder, MockServer, Request, Respond, ResponseTemplate};
 
 /// Exposes the signed message as the signature, so tests can read it.
@@ -142,6 +145,28 @@ async fn discovery_follows_cursors_until_the_end() {
         .await;
     let markets = client.markets(MarketQuery::Open).await.unwrap();
     assert_eq!(tickers(&markets), ["A", "B"]);
+}
+
+/// A full market page is about 2 MB of JSON and a sixteenth of that
+/// compressed, so the client must ask for and decode gzip.
+#[tokio::test]
+async fn market_pages_are_requested_and_decoded_as_gzip() {
+    let (server, client) = markets_server().await;
+    let body = json!({ "markets": [{ "ticker": "A", "status": "active" }], "cursor": "" });
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body.to_string().as_bytes()).unwrap();
+    first_page()
+        .and(header("accept-encoding", "gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "gzip")
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(encoder.finish().unwrap()),
+        )
+        .mount(&server)
+        .await;
+    let markets = client.markets(MarketQuery::Open).await.unwrap();
+    assert_eq!(tickers(&markets), ["A"]);
 }
 
 #[tokio::test]
