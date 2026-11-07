@@ -699,9 +699,9 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "ergo-sbe"
-version = "0.1.16"
+version = "0.1.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2eb5418a01016b5cd295b76fbd322ccd1b20204db0193782a477ced69411e9"
+checksum = "8a5297bac6bf4030f6107c4e51941c6e39e9e703d5f55f19285c62b7dd165df2"
 dependencies = [
  "miette",
  "prettyplease",
